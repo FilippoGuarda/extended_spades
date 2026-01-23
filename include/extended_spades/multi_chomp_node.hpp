@@ -6,6 +6,7 @@
 #include <string>
 #include <cmath>
 #include <Eigen/Dense>
+#include <random>
 
 #include "rclcpp/rclcpp.hpp"
 #include "visualization_msg/msg/marker_array.hpp"
@@ -60,18 +61,17 @@ private:
     Matrix AARinv_; // AAR inverse 
     Vector bbR_; // acceleration bias
 
-    // state scenarios
-    std::vector::<Vector>start_states_;
+    // state scenarios 
+    std::vector::<Vector> start_states_;
     std::vector::<Vector> goal_states_;
+
+    void map_callback(const nav_msg::msg::OccupancyGrid::SharedPtr msg);
+
+    double get_environment_distance(double x, double y, Eigen::Vector2d& gradient);
 
     // helpers initialization
     void load_parameters();
     void init_matrices();
-
-    Vector start_pos_, end_pos_;
-
-    void init_chomp_matrices();
-    void init_scenario();
 
     void publish_state();
 
