@@ -151,6 +151,7 @@ void MultiChompNode::solve_step() {
     }
 
     Vector nabla_smooth = AAR_ * xi_ + bbr_;
+    // obstacle and interference gradients
     Vector nabla_obs = Vector::Zero(xidim_);
     Vector nabla_inter = Vector::Zero(xidim_);
     // robot pairs iteration
@@ -168,12 +169,40 @@ void MultiChompNode::solve_step() {
                 double safety_dist = params_.robot_radius * 3.0;
 
                 if (dist < safety_dist && dist > 1e-6) {
+                    // update safety distance gradient
                     Vector grad_force = -1.0 * (safety_dist - dist) * (diff / dist);
+
                     nabla_inter.block(idx1, 0, cdim_, 1) += grad_force;
                     nabla_inter.block(idx2, 0, cdim_, 1) -= grad_force;
                 }
             }
         }
     }
+
+    // create mutex lock to reduce lock scope
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+
+        // one configuration per waypoint
+        const int num_points = static_cast<int>(xidim_ / cdim_);
+        for (int i = 0; i < num_points; ++i){
+            int idx = i * static_cast<int>(cdim_);
+            Vector pt = xi_.block(idx, 0, cdim_, 1);
+            
+            Eigen::Vector2d grad_env;
+            double dist = get_environment_distance(pt(0), pt(1), grad_env);
+
+            if (dist < params_.obstacle_max_dist) {
+                double weight = (params_.obstacle_max_dist - dist);
+                nabla_obs.block(idx, 0, cdim_, 1) -= weight * Vector(grad_env);
+            }
+        }
+    }
+
+    Vector total_grad = nabla_obs + params_.lambda * nabla_smooth + params_.mu * nabla_inter;
+    Vector dxi = AARinv_ * total_grad;
+    xi_ -= (1.0 / params_.eta) * dxi;
+
+    publish_state();
 
 }
