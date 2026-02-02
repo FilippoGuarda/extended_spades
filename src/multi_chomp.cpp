@@ -86,6 +86,86 @@ void MultiChompNode::map_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr 
 
     std::lock_guard<std::mutex> lock(map_mutex_);
     current_map_ = *msg;
+    update_distance_map(*msg);
     map_received_ = true;
 }
 
+void MultiChompNode::update_distance_map(const nav_msgs::msg::OccupancyGrid& grid){
+    map_resolution_ = grid.info.resolution;
+    map_origin_x_ = grid.info.origin.position.x;
+    map_origin_y_ = grid.info.origin.positoin.y;
+    map_width_ = grid.info.width;
+    map_height_ = grid.info.height;
+
+    cv::Mat bin_img(map_height_, map_width_, CV_8UC1);
+    
+    for(int i= 0; i<map_height_; ++i) {
+        for(int j= 0; j<map_width_; ++j){
+
+            int8_t val = grid.data[i*map_width_ + j];
+            if (val > 50) {
+                bin_img.at<uint8_t>(i, j) = 0; // obstacle 
+            } else {
+                bin_img.at<uint8_t>(i, j) = 255; // free
+            }
+
+        }
+    }
+
+    cv::Mat dist_img_pixels;
+    cv::distanceTransform(bin_img, dist_img_pixels, cv::DIST_L2, 5);
+
+    dist_map_ = dist_img_pixels * map_resulution_;
+
+    cv::Sobel(dist_map_, dist_grad_x_, CV_64F, 1, 0, 3); // dx
+    cv::Sobel(dist_map_, dist_grad_y_, CV_64F, 0, 1, 3); // dy
+
+    // TODO: implement gradient with bilinear interpolation of distance map at query time
+
+}
+
+double MultiChompNode::get_environment_distance(double x, double y, Eigen::Vector2d& gradient) {
+    
+}
+
+
+void MultiChompNode::solve_step() {
+    if (!map_received_) {
+        return;
+    }
+
+    Vector nabla_smooth = AAR_ * xi_ + bbr_;
+    Vector nabla_obs = Vector::Zero(xidim_);
+    Vector nabla_inter = Vector::Zero(xidim_);
+    // robot pairs iteration
+    for (int r1 = 0; r1 < params_.num_robots; ++r1) {
+        for (int r2 = 0; r2 < params_.num_robots; ++r2) {
+            // iterate each waypoint (synchronous time steps)
+            for (int k = 0; k < params_.waypoints_per_robot; ++k){
+                int idx1 = (r1 * params_.waypoints_per_robot + k) * cdim_;
+                int idx2 = (r2 * params_.waypoints_per_robot + k) * cdim_;
+
+                Vector p1 = xi_.block(idx1, 0, cdim_, 1);
+                Vector p2 = xi_.block(idx2, 0, cdim_, 1); 
+
+                Vector diff = p1 - p2; 
+                double dist = diff.norm();
+                double safety_dist = params_.robot_radius * 3.0;
+
+                if (dist < safety_dist && dist < 1e-6) {
+                    Vector grad_force = -1.0 * (safety_dist - dist) * (diff / dist);
+
+                    nabla_inter.block(idx1, 0, cdim_, 1) += grad_force;
+                    nable_inter.block(idx2, 0, cdim_, 1) -= grad_force;
+                }
+            }
+        }
+    }
+
+    // robot vs environent distance
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+
+    }
+
+}

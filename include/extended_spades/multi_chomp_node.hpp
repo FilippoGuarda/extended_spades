@@ -7,6 +7,7 @@
 #include <cmath>
 #include <Eigen/Dense>
 #include <random>
+#include <opencv2/opencv.hpp>
 
 #include "rclcpp/rclcpp.hpp"
 #include "visualization_msg/msg/marker_array.hpp"
@@ -50,6 +51,16 @@ private:
 
     // state
     ChompParameters params_;
+
+    // distance field state
+    cv::Mat dist_map_;
+    cv::Mat dist_grad_x_;
+    cv::Mat dist_grad_y_;
+    float map_resolution_;
+    double map_origin_x_, map_origin_y_;
+    int map_width_; map_height_;
+    void update_distance_map(const nav_msgs::msg::OccupancyGrid& grid);
+    
 
     // trajectory state
     size_t cdim_ = 2; // 2D (number of dimensions)

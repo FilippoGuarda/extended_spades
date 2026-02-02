@@ -24,6 +24,7 @@ ament_target_dependencies(multi_chomp_node
   geometry_msgs
   visualization_msgs
   Eigen3
+  OpenCV
 )
 
 # 4. Install Rules (Where to put the binary)
