@@ -23,7 +23,7 @@ struct ChompParameters {
     double lambda = 1.0;
     double mu = 0.4;
     double robot_radius = 0.5;
-
+    double obstacle_max_dist = 50.0;
     int num_robots = 2;
     int waypoints_per_robot = 20;
 };

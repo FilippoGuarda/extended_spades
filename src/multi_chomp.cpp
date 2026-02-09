@@ -6,7 +6,6 @@ MultiChompNode::MultiChompNode() : Node("extended_spades_server") {
 
     load_parameters();
     init_matrices();
-    init_default_scenario();
     // ROS interface
     marker_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray> ("plan_markers", 10);
     rclcpp::QoS map_qos(1);
@@ -39,6 +38,8 @@ void MultiChompNode::load_parameters()
     params_.mu = this->get_parameter("mu").as_double();
 
     xidim_ = params_.num_robots * params_.waypoints_per_robot * cdim_;
+    xi_  = Vector::Zero(xidim_);
+    bbR_ = Vector::Zero(xidim_);
 }
 
 void MultiChompNode::init_matrices() {
@@ -66,19 +67,7 @@ void MultiChompNode::init_matrices() {
     }
     AAR_ /= (params_.dt * params_.dt * (nq + 1));
     AARinv_ = AAR_.inverse();
-
-    // scale with time step
-    AAR_ /= (params_.dt * params_.dt * (nq + 1));
-
-    // IMPORTANT!!!!!! <-----------------------------------------------------------------------
-    // pre compute inverse for update xi = xi - (1/eta) * Ainv * Gradient
-    // if N > 50 you might want to invert the block diagonal matrix instead of the full thing
-    AARinv_ = AAR_.inverse();
 }
-
-// void MultiChompNode::init_default_scenario() {
-    // 
-// }
 
 // map callback placeholder
 void MultiChompNode::map_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
@@ -117,7 +106,10 @@ void MultiChompNode::update_distance_map(const nav_msgs::msg::OccupancyGrid& gri
 
 double MultiChompNode::get_environment_distance(double x, double y, Eigen::Vector2d& gradient)
 {
-    if (dist_map_.empty()) return 0.0;
+    if (dist_map_.empty()) {
+        gradient << 0.0, 0.0;
+        return 999.0;
+    }
 
     double gx = (x - map_origin_x_) / map_resolution_;
     double gy = (y - map_origin_y_) / map_resolution_;
@@ -144,13 +136,12 @@ double MultiChompNode::get_environment_distance(double x, double y, Eigen::Vecto
     return static_cast<double>(dist);
 }
 
-
 void MultiChompNode::solve_step() {
     if (!map_received_) {
         return;
     }
 
-    Vector nabla_smooth = AAR_ * xi_ + bbr_;
+    Vector nabla_smooth = AAR_ * xi_ + bbR_;
     // obstacle and interference gradients
     Vector nabla_obs = Vector::Zero(xidim_);
     Vector nabla_inter = Vector::Zero(xidim_);
