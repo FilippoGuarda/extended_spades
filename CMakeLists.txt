@@ -15,7 +15,11 @@ find_package(eigen3_cmake_module REQUIRED)
 find_package(Eigen3 REQUIRED)
 
 # 2. Define the Executable
-add_executable(multi_chomp_node src/multi_chomp_node.cpp)
+add_executable(multi_chomp_node
+  src/multi_chomp_node.cpp
+  src/extended_spades_action_server.cpp
+  src/extended_spades_action_server_main.cpp
+)
 
 # 3. Link Dependencies
 ament_target_dependencies(multi_chomp_node
@@ -23,6 +27,8 @@ ament_target_dependencies(multi_chomp_node
   rclcpp_action
   geometry_msgs
   visualization_msgs
+  extended_spades_msgs
+  nav_msgs
   Eigen3
   OpenCV
 )

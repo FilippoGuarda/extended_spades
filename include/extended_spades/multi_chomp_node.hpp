@@ -13,6 +13,7 @@
 #include "visualization_msg/msg/marker_array.hpp"
 #include "geometry_msg/point.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
+#include "nav_msgs/msg/path.hpp"
 
 typedef Eigen::VectorXd Vector;
 typedef Eigen::MatrixXd Matrix;
@@ -33,6 +34,14 @@ class MultiChompNode : public rclcpp::Node {
 public MultiChompNode();
 
     void solve_step();
+    int get_num_robots() const { return params_.num_robots; }
+
+    // multi chomp accessors
+    // start with imput global paths (computed with nav2)
+    bool set_paths(const std::vector<nav_msgs::msg::Path> & paths);
+    // export state as optimized path
+    std::vector<nav_msgs::msg::Path>
+    get_paths(const std::vector<nav_msgs::msg::Path> & templates) const;
 
 private:
     // visualization publisher
@@ -43,8 +52,8 @@ private:
 
     // costmap subscriber
     rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr grid_sub_;
-    // state protection
-
+    
+    // state protection lock
     std::mutex map_mutex_;
     nav_msgs::msg::OccupancyGrid current_map_;
     bool map_received_ = false;
