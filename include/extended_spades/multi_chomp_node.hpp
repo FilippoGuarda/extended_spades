@@ -15,8 +15,8 @@
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "nav_msgs/msg/path.hpp"
 
-typedef Eigen::VectorXd Vector;
-typedef Eigen::MatrixXd Matrix;
+typedef Eigen::Vector2d Vector;
+typedef Eigen::Matrix2d Matrix;
 
 struct ChompParameters {
     double dt = 1.0;
@@ -84,6 +84,8 @@ private:
     // state scenarios 
     std::vector::<Vector> start_states_;
     std::vector::<Vector> goal_states_;
+    // extend a provided path into a fixed number of waypoints
+    std::Vector::<Vector> resample_path(const nav_msgs::msg::Path & path, int num_points) const;
 
     void map_callback(const nav_msg::msg::OccupancyGrid::SharedPtr msg);
 
@@ -95,7 +97,7 @@ private:
 
     void publish_state();
 
-}
+};
 
 
 #endif EXTENDED_SPADES__MULTI_CHOMP_NODE_HPP_

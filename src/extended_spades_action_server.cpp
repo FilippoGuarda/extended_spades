@@ -67,12 +67,6 @@ void ExtendedSpadesActionServer::handle_accepted(
 bool ExtendedSpadesActionServer::load_paths_into_state(
     const std::vector<nav_msgs::msg::Path> & paths)
 {
-  // This function should:
-  //  - resample each Path to waypoints_per_robot points,
-  //  - pack into optimizer_->xi_,
-  //  - set optimizer_->bbR_ with boundary constraints.
-
-  // For now, just call a method you’ll add to MultiChompNode:
   return optimizer_->set_paths(paths);
 }
 

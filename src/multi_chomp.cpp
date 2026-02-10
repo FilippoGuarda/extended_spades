@@ -136,6 +136,184 @@ double MultiChompNode::get_environment_distance(double x, double y, Eigen::Vecto
     return static_cast<double>(dist);
 }
 
+std::vector<nav_msgs::msg::Path>
+MultiChompNode::get_paths(const std::vector<nav_msgs::msg::Path> & templates) const
+{
+  std::vector<nav_msgs::msg::Path> out;
+  out.resize(params_.num_robots);
+
+  const int nq = params_.waypoints_per_robot;
+  if (xidim_ != params_.num_robots * nq * cdim_) {
+    RCLCPP_WARN(rclcpp::get_logger("MultiChompNode"),
+                "get_paths: dimension mismatch, returning empty paths");
+    return out;
+  }
+
+  for (int r = 0; r < params_.num_robots; ++r) {
+    nav_msgs::msg::Path path;
+
+    if (r < static_cast<int>(templates.size())) {
+      path.header = templates[r].header; // keep frame_id and stamp
+    } else if (!templates.empty()) {
+      path.header = templates[0].header;
+    } else {
+      path.header.frame_id = "map"; // fallback
+      path.header.stamp = this->now();
+    }
+
+    size_t robot_offset = static_cast<size_t>(r) * nq * cdim_;
+    path.poses.resize(nq);
+
+    for (int k = 0; k < nq; ++k) {
+      size_t idx = robot_offset + static_cast<size_t>(k) * cdim_;
+      Eigen::Vector2d p = xi_.block(idx, 0, cdim_, 1);
+
+      geometry_msgs::msg::PoseStamped ps;
+      ps.header = path.header;
+      ps.pose.position.x = p.x();
+      ps.pose.position.y = p.y();
+      ps.pose.position.z = 0.0;
+      // orientation left as default; could be derived from tangent.
+
+      path.poses[k] = ps;
+    }
+
+    out[r] = std::move(path);
+  }
+
+  return out;
+}
+
+
+// path resampling from nav2 provided to single elements
+std::vector<Eigen::Vector2d>
+MultiChompNode::resample_path(const nav_msgs::msg::Path & path,
+                              int num_points) const
+{
+  std::vector<Eigen::Vector2d> out;
+  out.reserve(num_points);
+
+  const size_t n = path.poses.size();
+  if (n == 0 || num_points <= 0) {
+    return out;
+  }
+  if (n == 1) {
+    // fill with same pose if only one path received
+    Eigen::Vector2d p(path.poses[0].pose.position.x,
+                      path.poses[0].pose.position.y);
+    out.assign(num_points, p);
+    return out;
+  }
+
+  // get total arc length
+  std::vector<double> s(n, 0.0);
+  for (size_t i = 1; i < n; ++i) {
+    const auto & p0 = path.poses[i - 1].pose.position;
+    const auto & p1 = path.poses[i].pose.position;
+    double dx = p1.x - p0.x;
+    double dy = p1.y - p0.y;
+    s[i] = s[i - 1] + std::sqrt(dx * dx + dy * dy);
+  }
+  double L = s.back();
+  if (L < 1e-6) {
+    // arc small, approximate to single point
+    Eigen::Vector2d p(path.poses[0].pose.position.x,
+                      path.poses[0].pose.position.y);
+    out.assign(num_points, p);
+    return out;
+  }
+
+  // sample at equal spaces
+  for (int k = 0; k < num_points; ++k) {
+    double target_s = (static_cast<double>(k) /
+                       static_cast<double>(num_points - 1)) * L;
+
+    // find segment [i, i+1] such that s[i] <= target_s <= s[i+1]
+    size_t i = 0;
+    while (i + 1 < n && s[i + 1] < target_s) {
+      ++i;
+    }
+    size_t j = std::min(i + 1, n - 1);
+
+    double ds = s[j] - s[i];
+    double alpha = (ds > 1e-6) ? (target_s - s[i]) / ds : 0.0;
+
+    const auto & p0 = path.poses[i].pose.position;
+    const auto & p1 = path.poses[j].pose.position;
+
+    Eigen::Vector2d p;
+    p.x() = (1.0 - alpha) * p0.x + alpha * p1.x;
+    p.y() = (1.0 - alpha) * p0.y + alpha * p1.y;
+
+    out.push_back(p);
+  }
+
+  return out;
+}
+
+bool MultiChompNode::set_paths(const std::vector<nav_msgs::msg::Path> & paths)
+{
+  if (static_cast<int>(paths.size()) != params_.num_robots) {
+    RCLCPP_ERROR(this->get_logger(),
+                 "set_paths: paths.size() = %zu, num_robots = %d",
+                 paths.size(), params_.num_robots);
+    return false;
+  }
+
+  const int nq = params_.waypoints_per_robot;
+  if (nq <= 1) {
+    RCLCPP_ERROR(this->get_logger(),
+                 "set_paths: waypoints_per_robot must be > 1");
+    return false;
+  }
+
+  // resize start/goal containers
+  start_states_.resize(params_.num_robots);
+  goal_states_.resize(params_.num_robots);
+
+  // xi_ and bbR_ must have correct dimension
+  xidim_ = params_.num_robots * nq * cdim_;
+  xi_    = Vector::Zero(xidim_);
+  bbR_   = Vector::Zero(xidim_);
+
+  for (int r = 0; r < params_.num_robots; ++r) {
+    const auto & path = paths[r];
+
+    if (path.poses.size() < 2) {
+      RCLCPP_ERROR(this->get_logger(),
+                   "set_paths: robot %d path has < 2 poses", r);
+      return false;
+    }
+
+    // store start and goal from the raw path
+    const auto & p_start = path.poses.front().pose.position;
+    const auto & p_goal  = path.poses.back().pose.position;
+
+    start_states_[r] = Eigen::Vector2d(p_start.x, p_start.y);
+    goal_states_[r]  = Eigen::Vector2d(p_goal.x,  p_goal.y);
+
+    // path to nq waypoints
+    auto samples = resample_path(path, nq);
+    if (static_cast<int>(samples.size()) != nq) {
+      RCLCPP_ERROR(this->get_logger(),
+                   "set_paths: resample failed for robot %d", r);
+      return false;
+    }
+
+    // pack into xi_
+    size_t robot_offset = static_cast<size_t>(r) * nq * cdim_;
+    for (int k = 0; k < nq; ++k) {
+      size_t idx = robot_offset + static_cast<size_t>(k) * cdim_;
+      xi_.block(idx, 0, cdim_, 1) = samples[k];
+    }
+  }
+
+  RCLCPP_INFO(this->get_logger(),
+              "Loaded %d robot paths into optimizer state", params_.num_robots);
+  return true;
+}
+
+
 void MultiChompNode::solve_step() {
     if (!map_received_) {
         return;
@@ -193,6 +371,20 @@ void MultiChompNode::solve_step() {
     Vector total_grad = nabla_obs + params_.lambda * nabla_smooth + params_.mu * nabla_inter;
     Vector dxi = AARinv_ * total_grad;
     xi_ -= (1.0 / params_.eta) * dxi;
+
+    // fixed start and end for each robot
+    const int nq = params_.waypoints_per_robot;
+    for (int r = 0; r < params_.num_robots; ++r) {
+    size_t robot_offset = static_cast<size_t>(r) * nq * cdim_;
+
+    if (r < static_cast<int>(start_states_.size())) {
+        xi_.block(robot_offset, 0, cdim_, 1) = start_states_[r];
+    }
+    if (r < static_cast<int>(goal_states_.size())) {
+        size_t last_idx = robot_offset + static_cast<size_t>(nq - 1) * cdim_;
+        xi_.block(last_idx, 0, cdim_, 1) = goal_states_[r];
+    }
+    }
 
     publish_state();
 
