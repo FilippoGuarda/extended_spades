@@ -1,0 +1,12 @@
+# Goal
+int32 num_robots
+nav_msgs/Path[] input_paths
+int32 max_iterations
+---
+# Result
+nav_msgs/Path[] optimized_paths
+---
+# Feedback
+float32 progress
+int32 current_iteration
+float32 current_cost

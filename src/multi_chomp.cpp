@@ -1,4 +1,4 @@
-#include "multi_chomp_node.hpp"
+#include "extended_spades/multi_chomp.hpp"
 
 using std::placeholders::_1;
 
@@ -15,8 +15,8 @@ MultiChompNode::MultiChompNode() : Node("extended_spades_server") {
     grid_sub_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>
         ("/global_costmap/costmap", map_qos, std::bind(&MultiChompNode::map_callback, this, _1));
 
-    // timer
-    timer_ = this->create_wall_timer(std::chrono::milliseconds(33), std::bind(&MultiChompNode::solve_step, this));
+    // timer (using action call for syncing the optimization step)
+    // timer_ = this->create_wall_timer(std::chrono::milliseconds(33), std::bind(&MultiChompNode::solve_step, this));
 
     RCLCPP_INFO(this->get_logger(), "Extended SPADES server initialized for %d robots", params_.num_robots);
 }
@@ -104,7 +104,7 @@ void MultiChompNode::update_distance_map(const nav_msgs::msg::OccupancyGrid& gri
     cv::Sobel(dist_map_, dist_grad_y_, CV_64F, 0, 1, 3);
 }
 
-double MultiChompNode::get_environment_distance(double x, double y, Eigen::Vector2d& gradient)
+double MultiChompNode::get_environment_distance(double x, double y, Eigen::Vector2d& gradient) const
 {
     if (dist_map_.empty()) {
         gradient << 0.0, 0.0;
@@ -388,4 +388,97 @@ void MultiChompNode::solve_step() {
 
     publish_state();
 
+}
+
+double MultiChompNode::compute_current_cost() const {
+  if (!map_received_) {
+    return 0.0;
+  }
+
+  double total_cost = 0.0;
+
+  // compute smoothness cost
+  Vector smooth_term = AAR_ * xi_ + bbR_;
+  double smoothness_cost = 0.5 * xi_.dot(smooth_term);
+  total_cost += params_.lambda * smoothness_cost;
+
+  // compute obstacle cost
+  double obstacle_cost = 0.0;
+  const int num_points = static_cast<int>(xidim_ / cdim_);
+  for (int i = 0; i < num_points; ++i) {
+    int idx = i * static_cast<int>(cdim_);
+    Vector pt = xi_.block(idx, 0, cdim_, 1);
+    Eigen::Vector2d grad_env;
+    double dist = get_environment_distance(pt(0), pt(1), grad_env);
+    if (dist < params_.obstacle_max_dist) {
+      double penetration = params_.obstacle_max_dist - dist;
+      obstacle_cost += penetration * penetration;
+    }
+  }
+  total_cost += obstacle_cost;
+
+  // compute cost of robot on robot collision
+  double interference_cost = 0.0;
+  for (int r1 = 0; r1 < params_.num_robots; ++r1) {
+    for (int r2 = r1 + 1; r2 < params_.num_robots; ++r2) {
+      for (int k = 0; k < params_.waypoints_per_robot; ++k) {
+        int idx1 = (r1 * params_.waypoints_per_robot + k) * static_cast<int>(cdim_);
+        int idx2 = (r2 * params_.waypoints_per_robot + k) * static_cast<int>(cdim_);
+        Vector p1 = xi_.block(idx1, 0, cdim_, 1);
+        Vector p2 = xi_.block(idx2, 0, cdim_, 1);
+        Vector diff = p1 - p2;
+        double dist = diff.norm();
+        double safety_dist = params_.robot_radius * 3.0;
+        if (dist < safety_dist) {
+          double violation = safety_dist - dist;
+          interference_cost += violation * violation;
+        }
+      }
+    }
+  }
+  total_cost += params_.mu * interference_cost;
+
+  return total_cost;
+}
+
+
+void MultiChompNode::publish_state() {
+  visualization_msgs::msg::MarkerArray marker_array;
+  
+  const int nq = params_.waypoints_per_robot;
+  
+  // a line strip marker for each robot's trajectory
+  for (int r = 0; r < params_.num_robots; ++r) {
+    visualization_msgs::msg::Marker marker;
+    marker.header.frame_id = "map";
+    marker.header.stamp = this->now();
+    marker.ns = "robot_" + std::to_string(r);
+    marker.id = r;
+    marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    marker.action = visualization_msgs::msg::Marker::ADD;
+    marker.scale.x = 0.05; // line width
+    
+    // each robot gets a color
+    marker.color.a = 1.0;
+    marker.color.r = (r == 0) ? 1.0 : 0.0;
+    marker.color.g = (r == 1) ? 1.0 : 0.0;
+    marker.color.b = (r > 1) ? 1.0 : 0.0;
+    
+    // points for each robot
+    size_t robot_offset = static_cast<size_t>(r) * nq * cdim_;
+    for (int k = 0; k < nq; ++k) {
+      size_t idx = robot_offset + static_cast<size_t>(k) * cdim_;
+      Eigen::Vector2d pt = xi_.block(idx, 0, cdim_, 1);
+      
+      geometry_msgs::msg::Point p;
+      p.x = pt.x();
+      p.y = pt.y();
+      p.z = 0.0;
+      marker.points.push_back(p);
+    }
+    
+    marker_array.markers.push_back(marker);
+  }
+  
+  marker_pub_->publish(marker_array);
 }

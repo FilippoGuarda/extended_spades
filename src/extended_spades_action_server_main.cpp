@@ -1,5 +1,5 @@
 #include "rclcpp/rclcpp.hpp"
-#include "extended_spades_action_server.hpp"
+#include "extended_spades/extended_spades_action_server.hpp"
 
 int main(int argc, char ** argv)
 {

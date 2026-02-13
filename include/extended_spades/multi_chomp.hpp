@@ -1,5 +1,5 @@
-#ifndef EXTENDED_SPADES__MULTI_CHOMP_NODE_HPP_
-#define EXTENDED_SPADES__MULTI_CHOMP_NODE_HPP_
+#ifndef EXTENDED_SPADES__MULTI_CHOMP_HPP_
+#define EXTENDED_SPADES__MULTI_CHOMP_HPP_
 
 #include <vector>
 #include <mutex>
@@ -10,8 +10,8 @@
 #include <opencv2/opencv.hpp>
 
 #include "rclcpp/rclcpp.hpp"
-#include "visualization_msg/msg/marker_array.hpp"
-#include "geometry_msg/point.hpp"
+#include "visualization_msgs/msg/marker_array.hpp"
+#include "geometry_msgs/msg/point.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "nav_msgs/msg/path.hpp"
 
@@ -31,7 +31,9 @@ struct ChompParameters {
 
 class MultiChompNode : public rclcpp::Node {
 
-public MultiChompNode();
+public:
+
+    MultiChompNode();
 
     void solve_step();
     int get_num_robots() const { return params_.num_robots; }
@@ -39,6 +41,8 @@ public MultiChompNode();
     // multi chomp accessors
     // start with imput global paths (computed with nav2)
     bool set_paths(const std::vector<nav_msgs::msg::Path> & paths);
+    bool has_map() const { return map_received_; };
+    double compute_current_cost() const;    
     // export state as optimized path
     std::vector<nav_msgs::msg::Path>
     get_paths(const std::vector<nav_msgs::msg::Path> & templates) const;
@@ -48,7 +52,7 @@ private:
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
 
     // loop timer
-    rclcpp::TimerBase::SharedPtr timer_;
+    // rclcpp::TimerBase::SharedPtr timer_;
 
     // costmap subscriber
     rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr grid_sub_;
@@ -67,7 +71,7 @@ private:
     cv::Mat dist_grad_y_;
     float map_resolution_;
     double map_origin_x_, map_origin_y_;
-    int map_width_; map_height_;
+    int map_width_, map_height_;
     void update_distance_map(const nav_msgs::msg::OccupancyGrid& grid);
     
 
@@ -82,14 +86,14 @@ private:
     Vector bbR_; // acceleration bias
 
     // state scenarios 
-    std::vector::<Vector> start_states_;
-    std::vector::<Vector> goal_states_;
+    std::vector<Vector> start_states_;
+    std::vector<Vector> goal_states_;
     // extend a provided path into a fixed number of waypoints
-    std::Vector::<Vector> resample_path(const nav_msgs::msg::Path & path, int num_points) const;
+    std::vector<Vector> resample_path(const nav_msgs::msg::Path & path, int num_points) const;
 
-    void map_callback(const nav_msg::msg::OccupancyGrid::SharedPtr msg);
+    void map_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
 
-    double get_environment_distance(double x, double y, Eigen::Vector2d& gradient);
+    double get_environment_distance(double x, double y, Eigen::Vector2d& gradient) const;
 
     // helpers initialization
     void load_parameters();
@@ -100,4 +104,4 @@ private:
 };
 
 
-#endif EXTENDED_SPADES__MULTI_CHOMP_NODE_HPP_
+#endif //EXTENDED_SPADES__MULTI_CHOMP_HPP_

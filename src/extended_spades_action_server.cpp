@@ -1,4 +1,5 @@
-#include "extended_spades_action_server.hpp"
+#include "extended_spades/extended_spades_action_server.hpp"
+#include "extended_spades/multi_chomp.hpp"
 
 using std::placeholders::_1;
 using std::placeholders::_2;
@@ -85,6 +86,18 @@ void ExtendedSpadesActionServer::execute_goal(
   MultiChompOptimize::Result result;
   MultiChompOptimize::Feedback feedback;
 
+  // check for update every second
+  rclcpp::Rate wait_rate(1.0); 
+  while (rclcpp::ok() && !optimizer_->has_map()) {
+      if (goal_handle->is_canceling()) {
+          goal_handle->canceled(std::make_shared<MultiChompOptimize::Result>(result));
+          RCLCPP_INFO(this->get_logger(), "Goal canceled while waiting for map");
+          return;
+      }
+      RCLCPP_WARN(this->get_logger(), "Waiting for global costmap...");
+      wait_rate.sleep();
+  }
+
   if (!load_paths_into_state(goal->input_paths)) {
     RCLCPP_ERROR(this->get_logger(),
                  "Failed to load input paths into optimizer");
@@ -92,28 +105,36 @@ void ExtendedSpadesActionServer::execute_goal(
     return;
   }
 
-  const uint32_t max_iter =
-      (goal->max_iterations > 0) ? goal->max_iterations : 100;
+  const uint32_t max_iter = (goal->max_iterations > 0) ? goal->max_iterations : 100;
+  const double min_cost_change = 1e-4; // convergence threshold
+  double prev_cost = 1e9;
 
   for (uint32_t iter = 0; iter < max_iter; ++iter) {
     if (goal_handle->is_canceling()) {
       goal_handle->canceled(std::make_shared<MultiChompOptimize::Result>(result));
-      RCLCPP_INFO(this->get_logger(), "Goal canceled");
       return;
     }
 
-
     optimizer_->solve_step();
+    double current_cost = optimizer_->compute_current_cost();
+    
+    // check convergence
+    if (std::abs(prev_cost - current_cost) < min_cost_change) {
+      RCLCPP_INFO(this->get_logger(), "Converged at iteration %u", iter);
+      break;
+    }
 
-    feedback.progress = static_cast<float>(iter + 1) /
-                        static_cast<float>(max_iter);
-    feedback.current_cost = 0.0f; // TODO: compute actual cost
-    goal_handle->publish_feedback(
-        std::make_shared<MultiChompOptimize::Feedback>(feedback));
+    prev_cost = current_cost;
+    
+    // throttled feedback
+    if (iter % 10 == 0) {
+      feedback.progress = static_cast<float>(iter) / static_cast<float>(max_iter);
+      feedback.current_iteration = iter;
+      feedback.current_cost = current_cost;
+      goal_handle->publish_feedback(std::make_shared<MultiChompOptimize::Feedback>(feedback));
+    }
   }
 
   result.optimized_paths = export_state_to_paths(goal->input_paths);
   goal_handle->succeed(std::make_shared<MultiChompOptimize::Result>(result));
-
-  RCLCPP_INFO(this->get_logger(), "Goal succeeded");
 }

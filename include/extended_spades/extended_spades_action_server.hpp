@@ -4,21 +4,19 @@
 #include <memory>
 #include <thread>
 
-#include "rclcpp_components/rclcpp.hpp"
+#include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 
-#include "extended_spades_msgs/action/multi_chomp_optimize.hpp"
+#include "extended_spades/action/multi_chomp_optimize.hpp"
 #include "nav_msgs/msg/path.hpp"
 
-#include "multi_chomp_node.hpp"
+#include "multi_chomp.hpp"
 
 class ExtendedSpadesActionServer : public rclcpp::Node
 {
 public:
-    using MultiChompOptimize = 
-        extended_spades_msgs::action::MultiChompOptimize;
-    using GoalHandleMultiChomp = 
-        rclcpp_action::ServerGoalHandle<MultiChompOptimize>;
+    using MultiChompOptimize = extended_spades::action::MultiChompOptimize;
+    using GoalHandleMultiChomp = rclcpp_action::ServerGoalHandle<MultiChompOptimize>;
 
     explicit ExtendedSpadesActionServer(const rclcpp::NodeOptions & options =
                                         rclcpp::NodeOptions());
@@ -42,7 +40,7 @@ private:
         const std::shared_ptr<GoalHandleMultiChomp> goal_handle);
 
     bool load_paths_into_state( 
-        const std::vector<nav_msg::msg::Path> & paths
+        const std::vector<nav_msgs::msg::Path> & paths
     );
 
     std::vector<nav_msgs::msg::Path> export_state_to_paths(
