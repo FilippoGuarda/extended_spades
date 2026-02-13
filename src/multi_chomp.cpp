@@ -29,7 +29,9 @@ void MultiChompNode::load_parameters()
     this->declare_parameter<double>("eta", 100.0);
     this->declare_parameter<double>("lambda", 1.0);
     this->declare_parameter<double>("mu", 0.4);
-
+    // assuming robot_radius and obstacle_max_dist are also parameters or constants
+    params_.robot_radius = 0.5;
+    params_.obstacle_max_dist = 4.0;
     params_.num_robots = this->get_parameter("num_robots").as_int();
     params_.waypoints_per_robot = this->get_parameter("waypoints_per_robot").as_int();
     params_.dt = this->get_parameter("dt").as_double();
@@ -143,7 +145,7 @@ MultiChompNode::get_paths(const std::vector<nav_msgs::msg::Path> & templates) co
   out.resize(params_.num_robots);
 
   const int nq = params_.waypoints_per_robot;
-  if (xidim_ != params_.num_robots * nq * cdim_) {
+  if (xidim_ != static_cast<size_t>(params_.num_robots * nq * cdim_)) {
     RCLCPP_WARN(rclcpp::get_logger("MultiChompNode"),
                 "get_paths: dimension mismatch, returning empty paths");
     return out;
@@ -253,28 +255,31 @@ MultiChompNode::resample_path(const nav_msgs::msg::Path & path,
 
 bool MultiChompNode::set_paths(const std::vector<nav_msgs::msg::Path> & paths)
 {
-  if (static_cast<int>(paths.size()) != params_.num_robots) {
-    RCLCPP_ERROR(this->get_logger(),
-                 "set_paths: paths.size() = %zu, num_robots = %d",
-                 paths.size(), params_.num_robots);
-    return false;
-  }
-
+  int new_num_robots = static_cast<int>(paths.size());
   const int nq = params_.waypoints_per_robot;
   if (nq <= 1) {
-    RCLCPP_ERROR(this->get_logger(),
-                 "set_paths: waypoints_per_robot must be > 1");
+    RCLCPP_ERROR(this->get_logger(), "set_paths: waypoints_per_robot must be > 1");
     return false;
   }
 
-  // resize start/goal containers
-  start_states_.resize(params_.num_robots);
-  goal_states_.resize(params_.num_robots);
+  if (new_num_robots != params_.num_robots) {
+    RCLCPP_INFO(this->get_logger(), "Resizing optimizer state for %d robots", new_num_robots);
+    params_.num_robots = new_num_robots;
+    
+    xidim_ = params_.num_robots * nq * cdim_;
+    xi_    = Vector::Zero(xidim_);
+    bbR_   = Vector::Zero(xidim_);
+    
+    start_states_.resize(params_.num_robots);
+    goal_states_.resize(params_.num_robots);
+    
+    init_matrices(); 
+  }
 
-  // xi_ and bbR_ must have correct dimension
-  xidim_ = params_.num_robots * nq * cdim_;
-  xi_    = Vector::Zero(xidim_);
-  bbR_   = Vector::Zero(xidim_);
+  if (start_states_.size() != static_cast<size_t>(params_.num_robots)) {
+      start_states_.resize(params_.num_robots);
+      goal_states_.resize(params_.num_robots);
+  }
 
   for (int r = 0; r < params_.num_robots; ++r) {
     const auto & path = paths[r];
@@ -323,7 +328,7 @@ void MultiChompNode::solve_step() {
     // obstacle and interference gradients
     Vector nabla_obs = Vector::Zero(xidim_);
     Vector nabla_inter = Vector::Zero(xidim_);
-    // robot pairs iteration
+    // robot pairs iteration for interference
     for (int r1 = 0; r1 < params_.num_robots; ++r1) {
         for (int r2 = r1 + 1; r2 < params_.num_robots; ++r2) {
             for (int k = 0; k < params_.waypoints_per_robot; ++k) {
@@ -335,12 +340,10 @@ void MultiChompNode::solve_step() {
 
                 Vector diff = p1 - p2;
                 double dist = diff.norm();
-                double safety_dist = params_.robot_radius * 3.0;
+                double safety_dist = params_.robot_radius * 3.0; // Heuristic safety margin
 
                 if (dist < safety_dist && dist > 1e-6) {
-                    // update safety distance gradient
                     Vector grad_force = -1.0 * (safety_dist - dist) * (diff / dist);
-
                     nabla_inter.block(idx1, 0, cdim_, 1) += grad_force;
                     nabla_inter.block(idx2, 0, cdim_, 1) -= grad_force;
                 }
@@ -348,7 +351,7 @@ void MultiChompNode::solve_step() {
         }
     }
 
-    // create mutex lock to reduce lock scope
+    // obstacle gradients (with lock)
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
 
@@ -368,22 +371,23 @@ void MultiChompNode::solve_step() {
         }
     }
 
+    // Combine gradients and update
     Vector total_grad = nabla_obs + params_.lambda * nabla_smooth + params_.mu * nabla_inter;
     Vector dxi = AARinv_ * total_grad;
     xi_ -= (1.0 / params_.eta) * dxi;
 
-    // fixed start and end for each robot
+    // reset start/goal positions (hard constraints)
     const int nq = params_.waypoints_per_robot;
     for (int r = 0; r < params_.num_robots; ++r) {
-    size_t robot_offset = static_cast<size_t>(r) * nq * cdim_;
+        size_t robot_offset = static_cast<size_t>(r) * nq * cdim_;
 
-    if (r < static_cast<int>(start_states_.size())) {
-        xi_.block(robot_offset, 0, cdim_, 1) = start_states_[r];
-    }
-    if (r < static_cast<int>(goal_states_.size())) {
-        size_t last_idx = robot_offset + static_cast<size_t>(nq - 1) * cdim_;
-        xi_.block(last_idx, 0, cdim_, 1) = goal_states_[r];
-    }
+        if (r < static_cast<int>(start_states_.size())) {
+            xi_.block(robot_offset, 0, cdim_, 1) = start_states_[r];
+        }
+        if (r < static_cast<int>(goal_states_.size())) {
+            size_t last_idx = robot_offset + static_cast<size_t>(nq - 1) * cdim_;
+            xi_.block(last_idx, 0, cdim_, 1) = goal_states_[r];
+        }
     }
 
     publish_state();
@@ -456,13 +460,13 @@ void MultiChompNode::publish_state() {
     marker.id = r;
     marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
     marker.action = visualization_msgs::msg::Marker::ADD;
-    marker.scale.x = 0.05; // line width
+    marker.scale.x = 0.05;
     
-    // each robot gets a color
+    // cycle color for robots
     marker.color.a = 1.0;
-    marker.color.r = (r == 0) ? 1.0 : 0.0;
-    marker.color.g = (r == 1) ? 1.0 : 0.0;
-    marker.color.b = (r > 1) ? 1.0 : 0.0;
+    marker.color.r = (r % 3 == 0) ? 1.0 : 0.5;
+    marker.color.g = (r % 3 == 1) ? 1.0 : 0.5;
+    marker.color.b = (r % 3 == 2) ? 1.0 : 0.5;
     
     // points for each robot
     size_t robot_offset = static_cast<size_t>(r) * nq * cdim_;

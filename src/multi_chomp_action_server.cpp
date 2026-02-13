@@ -20,7 +20,7 @@ MultiChompActionServer::MultiChompActionServer(
         "multi_chomp_optimize",
         std::bind(&MultiChompActionServer::handle_goal, this, _1, _2),
         std::bind(&MultiChompActionServer::handle_cancel,   this, _1),
-        std::bind(&MultiChompActionServer::handle_accepted, this, _1));         
+        std::bind(&MultiChompActionServer::handle_accepted, this, _1));        
 
     RCLCPP_INFO(this->get_logger(), "multi chomp action server started");
 }
@@ -32,7 +32,7 @@ MultiChompActionServer::handle_goal(
 {
   // Forward check to optimizer’s parameters
   if (goal->num_robots == 0 ||
-      goal->input_paths.size() != goal->num_robots) {
+      static_cast<int>(goal->input_paths.size()) != goal->num_robots) {
     RCLCPP_WARN(this->get_logger(),
                 "Rejecting goal: num_robots = %u, paths.size() = %zu",
                 goal->num_robots, goal->input_paths.size());
@@ -40,10 +40,9 @@ MultiChompActionServer::handle_goal(
   }
 
   if (optimizer_->get_num_robots() != static_cast<int>(goal->num_robots)) {
-    RCLCPP_WARN(this->get_logger(),
-                "Rejecting goal: goal num_robots %u != optimizer num_robots %d",
-                goal->num_robots, optimizer_->get_num_robots());
-    return rclcpp_action::GoalResponse::REJECT;
+    RCLCPP_INFO(this->get_logger(),
+                "Dynamic reconfiguration: resizing optimizer from %d to %d robots",
+                optimizer_->get_num_robots(), goal->num_robots);
   }
 
   return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;

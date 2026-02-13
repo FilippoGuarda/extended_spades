@@ -1,108 +1,98 @@
 #!/usr/bin/env python3
-
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import Path
-from nav2_msgs.action import ComputePathToPose
+from nav_msgs2.action import ComputePathToPose
 from extended_spades.action import MultiChompOptimize
-import threading
-import time
 
 class FleetCoordinator(Node):
     def __init__(self):
         super().__init__('fleet_coordinator')
 
-        # Configuration
-        self.robot_names = ['robot1', 'robot2'] # Update with your namespaces
-        self.goals = {} # Store target poses {robot_name: PoseStamped}
-        self.raw_paths = {} # Store Nav2 paths {robot_name: Path}
-        self.optimized_paths = {}
-        
-        # Clients for Nav2 (one per robot)
+        self.declare_parameter('robot_count', 6)
+        self.robot_count = self.get_parameter('robot_count').value
+        self.robot_names = [f'robot{i}' for i in range(1, self.robot_count + 1)]
+        self.get_logger().info(f"Coordinating {self.robot_count} robots: {self.robot_names}")
+        self.goals = {}
+        self.raw_paths = {}
         self.nav2_clients = {}
         for name in self.robot_names:
-            # Connect to Nav2's path planning action server
             topic = f'/{name}/compute_path_to_pose'
             client = ActionClient(self, ComputePathToPose, topic)
             self.nav2_clients[name] = client
-            self.get_logger().info(f'Waiting for Nav2 server: {topic}')
-            # client.wait_for_server() # Uncomment to block until ready
-
-        # Client for Multi-CHOMP
         self.chomp_client = ActionClient(self, MultiChompOptimize, 'multi_chomp_optimize')
-        self.get_logger().info('Waiting for Multi-CHOMP server...')
-        self.chomp_client.wait_for_server()
-
-        # Timer to coordinate the loop (e.g., 2Hz)
         self.create_timer(0.5, self.coordination_loop)
-        
-        # Test: Set dummy goals for start (Replace with real goal subscription later)
-        self.set_dummy_goals()
+        self.goal_subs = []
+        for name in self.robot_names:
+            topic = f'/{name}/goal_pose'
+            self.goal_subs.append(
+                self.create_subscription(
+                    PoseStamped, 
+                    topic, 
+                    lambda msg, n=name: self.goal_callback(msg, n), 
+                    10
+                )
+            )
 
-    def set_dummy_goals(self):
-        # Example: Crossing paths
-        # Robot 1: (0,0) -> (5,5)
-        goal1 = PoseStamped()
-        goal1.header.frame_id = 'map'
-        goal1.pose.position.x = 5.0
-        goal1.pose.position.y = 5.0
-        self.goals['robot1'] = goal1
-
-        # Robot 2: (5,0) -> (0,5)
-        goal2 = PoseStamped()
-        goal2.header.frame_id = 'map'
-        goal2.pose.position.x = 0.0
-        goal2.pose.position.y = 5.0
-        self.goals['robot2'] = goal2
+    def goal_callback(self, msg, robot_name):
+        self.get_logger().info(f"Received goal for {robot_name}")
+        self.goals[robot_name] = msg
+        if robot_name in self.raw_paths:
+            del self.raw_paths[robot_name]
 
     def coordination_loop(self):
-        """Main loop: Get Nav2 paths -> Bundle -> Optimize"""
-        
-        # 1. Request Paths from Nav2 for all robots
-        futures = []
+        if not self.chomp_client.server_is_ready():
+            if self.chomp_client.wait_for_server(timeout_sec=0.1):
+                pass
+            else:
+                return
+
+        # request paths from nav2
         for name, client in self.nav2_clients.items():
-            if name in self.goals:
+            if name in self.goals and name not in self.raw_paths:
+                if not client.server_is_ready():
+                    continue 
+
                 goal_msg = ComputePathToPose.Goal()
                 goal_msg.goal = self.goals[name]
-                goal_msg.planner_id = "GridBased" # Or your preferred planner
+                goal_msg.planner_id = "GridBased" 
                 
-                # Send async request
                 future = client.send_goal_async(goal_msg)
-                futures.append((name, future))
+                future.add_done_callback(lambda f, n=name: self.nav2_goal_response_callback(f, n))
 
-        # 2. Wait for all paths (Synchronous for simplicity here, but non-blocking is better for production)
-        # Note: In a real system, you'd use callbacks. This is a simplified logic.
-        updated_any = False
+        active_robots = [r for r in self.robot_names if r in self.goals]
         
-        for name, future in futures:
-            rclpy.spin_until_future_complete(self, future, timeout_sec=1.0)
-            if future.result():
-                goal_handle = future.result()
-                res_future = goal_handle.get_result_async()
-                rclpy.spin_until_future_complete(self, res_future, timeout_sec=1.0)
-                
-                if res_future.result():
-                    path = res_future.result().result.path
-                    if len(path.poses) > 0:
-                        self.raw_paths[name] = path
-                        updated_any = True
+        if len(active_robots) > 0 and all(r in self.raw_paths for r in active_robots):
+            self.trigger_optimization(active_robots)
 
-        # 3. If we have paths for all robots, trigger optimization
-        if updated_any and len(self.raw_paths) == len(self.robot_names):
-            self.trigger_optimization()
-
-    def trigger_optimization(self):
-        self.get_logger().info("Triggering Multi-CHOMP optimization...")
+    def nav2_goal_response_callback(self, future, robot_name):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().warn(f"Nav2 rejected goal for {robot_name}")
+            return
         
+        res_future = goal_handle.get_result_async()
+        res_future.add_done_callback(lambda f, n=robot_name: self.nav2_result_callback(f, n))
+
+    def nav2_result_callback(self, future, robot_name):
+        result = future.result().result
+        path = result.path
+        if len(path.poses) > 0:
+            self.raw_paths[robot_name] = path
+            # self.get_logger().info(f"Got path for {robot_name}")
+
+    def trigger_optimization(self, active_robots):
         goal_msg = MultiChompOptimize.Goal()
-        goal_msg.num_robots = len(self.robot_names)
+        goal_msg.num_robots = len(active_robots)
         goal_msg.max_iterations = 100
         
-        # Ensure order matches self.robot_names list
-        for name in self.robot_names:
+        for name in active_robots:
             goal_msg.input_paths.append(self.raw_paths[name])
+
+        self.get_logger().info(f"Optimizing for {len(active_robots)} robots...")
+
+        self.raw_paths.clear() 
 
         future = self.chomp_client.send_goal_async(goal_msg)
         future.add_done_callback(self.optimization_response_callback)
@@ -112,24 +102,14 @@ class FleetCoordinator(Node):
         if not goal_handle.accepted:
             self.get_logger().error('Optimization rejected')
             return
-        
         res_future = goal_handle.get_result_async()
         res_future.add_done_callback(self.optimization_result_callback)
 
     def optimization_result_callback(self, future):
         result = future.result().result
         paths = result.optimized_paths
-        
-        self.get_logger().info(f"Received {len(paths)} optimized paths")
-        
-        # 4. Publish or distribute updated paths
-        # Here you would typically publish these to a path following controller
-        # e.g., /robot1/controller/follow_path
-        
-        for i, name in enumerate(self.robot_names):
-            if i < len(paths):
-                # Example: publish to visualization or controller
-                pass
+        self.get_logger().info(f"Optimization complete. Received {len(paths)} paths.")
+        # TODO: publish optimized paths to /robotX/plan or /robotX/path_controller...
 
 def main(args=None):
     rclpy.init(args=args)
