@@ -1,12 +1,12 @@
-#include "extended_spades/extended_spades_action_server.hpp"
+#include "extended_spades/multi_chomp_action_server.hpp"
 #include "extended_spades/multi_chomp.hpp"
 
 using std::placeholders::_1;
 using std::placeholders::_2;
 
-ExtendedSpadesActionServer::ExtendedSpadesActionServer(
+MultiChompActionServer::MultiChompActionServer(
     const rclcpp::NodeOptions & options) 
-    : Node("extended_spades_action_server", options)
+    : Node("multi_chomp_action_server", options)
 {
     // create optimizer component
     optimizer_ = std::make_shared<MultiChompNode>();
@@ -18,15 +18,15 @@ ExtendedSpadesActionServer::ExtendedSpadesActionServer(
     action_server_ = rclcpp_action::create_server<MultiChompOptimize>(
         this,
         "multi_chomp_optimize",
-        std::bind(&ExtendedSpadesActionServer::handle_goal, this, _1, _2),
-        std::bind(&ExtendedSpadesActionServer::handle_cancel,   this, _1),
-        std::bind(&ExtendedSpadesActionServer::handle_accepted, this, _1));         
+        std::bind(&MultiChompActionServer::handle_goal, this, _1, _2),
+        std::bind(&MultiChompActionServer::handle_cancel,   this, _1),
+        std::bind(&MultiChompActionServer::handle_accepted, this, _1));         
 
-    RCLCPP_INFO(this->get_logger(), "Extended SPADES action server started");
+    RCLCPP_INFO(this->get_logger(), "multi chomp action server started");
 }
 
 rclcpp_action::GoalResponse
-ExtendedSpadesActionServer::handle_goal(
+MultiChompActionServer::handle_goal(
     const rclcpp_action::GoalUUID &,
     std::shared_ptr<const MultiChompOptimize::Goal> goal)
 {
@@ -50,35 +50,35 @@ ExtendedSpadesActionServer::handle_goal(
 }
 
 rclcpp_action::CancelResponse
-ExtendedSpadesActionServer::handle_cancel(
+MultiChompActionServer::handle_cancel(
     const std::shared_ptr<GoalHandleMultiChomp> /*goal_handle*/)
 {
   RCLCPP_INFO(this->get_logger(), "Cancel request received");
   return rclcpp_action::CancelResponse::ACCEPT;
 }
 
-void ExtendedSpadesActionServer::handle_accepted(
+void MultiChompActionServer::handle_accepted(
     const std::shared_ptr<GoalHandleMultiChomp> goal_handle)
 {
   std::thread(
-      std::bind(&ExtendedSpadesActionServer::execute_goal, this, goal_handle)
+      std::bind(&MultiChompActionServer::execute_goal, this, goal_handle)
   ).detach();
 }
 
-bool ExtendedSpadesActionServer::load_paths_into_state(
+bool MultiChompActionServer::load_paths_into_state(
     const std::vector<nav_msgs::msg::Path> & paths)
 {
   return optimizer_->set_paths(paths);
 }
 
 std::vector<nav_msgs::msg::Path>
-ExtendedSpadesActionServer::export_state_to_paths(
+MultiChompActionServer::export_state_to_paths(
     const std::vector<nav_msgs::msg::Path> & template_paths) const
 {
   return optimizer_->get_paths(template_paths);
 }
 
-void ExtendedSpadesActionServer::execute_goal(
+void MultiChompActionServer::execute_goal(
     const std::shared_ptr<GoalHandleMultiChomp> goal_handle)
 {
   const auto goal = goal_handle->get_goal();

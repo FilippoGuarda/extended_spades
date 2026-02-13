@@ -1,5 +1,5 @@
-#ifndef EXTENDED_SPADES__EXTENDED_SPADES_ACTION_SERVER_HPP_
-#define EXTENDED_SPADES__EXTENDED_SPADES_ACTION_SERVER_HPP_
+#ifndef EXTENDED_SPADES__MULTI_CHOMP_ACTION_SERVER_HPP_
+#define EXTENDED_SPADES__MULTI_CHOMP_ACTION_SERVER_HPP_
 
 #include <memory>
 #include <thread>
@@ -12,13 +12,13 @@
 
 #include "multi_chomp.hpp"
 
-class ExtendedSpadesActionServer : public rclcpp::Node
+class MultiChompActionServer : public rclcpp::Node
 {
 public:
     using MultiChompOptimize = extended_spades::action::MultiChompOptimize;
     using GoalHandleMultiChomp = rclcpp_action::ServerGoalHandle<MultiChompOptimize>;
 
-    explicit ExtendedSpadesActionServer(const rclcpp::NodeOptions & options =
+    explicit MultiChompActionServer(const rclcpp::NodeOptions & options =
                                         rclcpp::NodeOptions());
 
 private: 
@@ -48,4 +48,4 @@ private:
     
 };
 
-#endif //EXTENDED_SPADES__EXTENDED_SPADES_ACTION_SERVER_HPP_
+#endif //EXTENDED_SPADES__MULTI_CHOMP_ACTION_SERVER_HPP_

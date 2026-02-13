@@ -1,0 +1,10 @@
+multi_chomp_node:
+  ros__parameters:
+    num_robots: 6
+    waypoints_per_robot: 40
+    dt: 1.0
+    eta: 100.0        # learning rate
+    lambda: 1.0       # smoothness 
+    mu: 10.0          # Obstacle/Collision weight
+    robot_radius: 0.4
+    obstacle_max_dist: 4.0

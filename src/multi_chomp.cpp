@@ -2,7 +2,7 @@
 
 using std::placeholders::_1;
 
-MultiChompNode::MultiChompNode() : Node("extended_spades_server") {
+MultiChompNode::MultiChompNode() : Node("multi_chomp_server") {
 
     load_parameters();
     init_matrices();
@@ -18,7 +18,7 @@ MultiChompNode::MultiChompNode() : Node("extended_spades_server") {
     // timer (using action call for syncing the optimization step)
     // timer_ = this->create_wall_timer(std::chrono::milliseconds(33), std::bind(&MultiChompNode::solve_step, this));
 
-    RCLCPP_INFO(this->get_logger(), "Extended SPADES server initialized for %d robots", params_.num_robots);
+    RCLCPP_INFO(this->get_logger(), "multi chomp server initialized for %d robots", params_.num_robots);
 }
 
 void MultiChompNode::load_parameters()

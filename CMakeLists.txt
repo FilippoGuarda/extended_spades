@@ -26,8 +26,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 # create the executables ONCE INTERFACES ARE CREATED OR IT DOES NOT WORK
 add_executable(multi_chomp
   src/multi_chomp.cpp
-  src/extended_spades_action_server.cpp
-  src/extended_spades_action_server_main.cpp
+  src/multi_chomp_action_server.cpp
+  src/multi_chomp_action_server_main.cpp
 )
 
 # linking libraries
@@ -55,6 +55,22 @@ rosidl_target_interfaces(multi_chomp
 
 install(TARGETS multi_chomp
   DESTINATION lib/${PROJECT_NAME}
+)
+
+# python script install
+install(PROGRAMS
+  scripts/multi_chomp_coordinator.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+# launch file install
+install(DIRECTORY launch
+  DESTINATION share/${PROJECT_NAME}
+)
+
+# config file install
+install(DIRECTORY config
+  DESTINATION share/${PROJECT_NAME}
 )
 
 ament_package()
