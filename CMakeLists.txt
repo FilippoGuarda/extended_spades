@@ -24,14 +24,14 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 )
 
 # create the executables ONCE INTERFACES ARE CREATED OR IT DOES NOT WORK
-add_executable(multi_chomp
+add_executable(multi_chomp_action_server
   src/multi_chomp.cpp
-  src/multi_chomp_action_server.cpp
+  src/multi_chomp_action_server.cpp 
   src/multi_chomp_action_server_main.cpp
 )
 
 # linking libraries
-ament_target_dependencies(multi_chomp
+ament_target_dependencies(multi_chomp_action_server
   rclcpp
   rclcpp_action
   geometry_msgs
@@ -41,19 +41,20 @@ ament_target_dependencies(multi_chomp
   OpenCV
 )
 
-target_include_directories(multi_chomp PUBLIC
+target_include_directories(multi_chomp_action_server PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(multi_chomp ${OpenCV_LIBRARIES})
+target_link_libraries(multi_chomp_action_server  ${OpenCV_LIBRARIES})
 
 # link 
-rosidl_target_interfaces(multi_chomp
-  ${PROJECT_NAME} "rosidl_typesupport_cpp"
-)
+rosidl_get_typesupport_target(cpp_typesupport_target
+  ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
-install(TARGETS multi_chomp
+target_link_libraries(multi_chomp_action_server "${cpp_typesupport_target}")
+
+install(TARGETS multi_chomp_action_server
   DESTINATION lib/${PROJECT_NAME}
 )
 

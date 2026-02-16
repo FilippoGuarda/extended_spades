@@ -15,8 +15,9 @@
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "nav_msgs/msg/path.hpp"
 
-typedef Eigen::Vector2d Vector;
-typedef Eigen::Matrix2d Matrix;
+typedef Eigen::Vector2d Vector2d;
+typedef Eigen::VectorXd VectorXd; 
+typedef Eigen::MatrixXd MatrixXd;
 
 struct ChompParameters {
     double dt = 1.0;
@@ -73,23 +74,20 @@ private:
     double map_origin_x_, map_origin_y_;
     int map_width_, map_height_;
     void update_distance_map(const nav_msgs::msg::OccupancyGrid& grid);
-    
 
-    // trajectory state
-    size_t cdim_ = 2; // 2D (number of dimensions)
-    size_t xidim_; 
-    Vector xi_;  // trajectory vector
-
-    Matrix AA_; // metrix matrix (cost)
-    Matrix AAR_; // multiple robots AA
-    Matrix AARinv_; // AAR inverse 
-    Vector bbR_; // acceleration bias
+    size_t cdim_ = 2;
+    size_t xidim_;
+    VectorXd xi_; // trajectory vector
+    MatrixXd AA_; // cost matrix    
+    MatrixXd AAR_; // multiple robots AA   
+    MatrixXd AARinv_; // AAR inverse 
+    VectorXd bbR_; // acceleration bias
 
     // state scenarios 
-    std::vector<Vector> start_states_;
-    std::vector<Vector> goal_states_;
+    std::vector<Vector2d> start_states_;
+    std::vector<Vector2d> goal_states_;
     // extend a provided path into a fixed number of waypoints
-    std::vector<Vector> resample_path(const nav_msgs::msg::Path & path, int num_points) const;
+    std::vector<Vector2d> resample_path(const nav_msgs::msg::Path & path, int num_points) const;
 
     void map_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
 
