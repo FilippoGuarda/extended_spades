@@ -23,7 +23,7 @@ MultiChompNode::MultiChompNode() : Node("multi_chomp_server") {
 
 void MultiChompNode::load_parameters()
 {
-    this->declare_parameter<int>("num_robots", 2);
+    this->declare_parameter<int>("num_robots", 6);
     this->declare_parameter<int>("waypoints_per_robot", 20);
     this->declare_parameter<double>("dt", 1.0);
     this->declare_parameter<double>("eta", 500.0);
@@ -93,7 +93,8 @@ void MultiChompNode::update_distance_map(const nav_msgs::msg::OccupancyGrid& gri
     for (int i = 0; i < map_height_; ++i) {
         for (int j = 0; j < map_width_; ++j) {
             int8_t val = grid.data[i * map_width_ + j];
-            bin_img.at<uint8_t>(i, j) = (val > 50) ? 0 : 255;
+            // Treat unknown (-1) as occupied to be conservative
+            bin_img.at<uint8_t>(i, j) = (val < 0 || val > 50) ? 0 : 255;
         }
     }
 
@@ -110,7 +111,7 @@ double MultiChompNode::get_environment_distance(double x, double y, Eigen::Vecto
 {
     if (dist_map_.empty()) {
         gradient << 0.0, 0.0;
-        return 999.0;
+        return 0.0;
     }
 
     double gx = (x - map_origin_x_) / map_resolution_;
@@ -118,7 +119,7 @@ double MultiChompNode::get_environment_distance(double x, double y, Eigen::Vecto
 
     if (gx < 1 || gx >= map_width_ - 1 || gy < 1 || gy >= map_height_ - 1) {
         gradient << 0.0, 0.0;
-        return 999.0;
+        return 0.0;
     }
 
     int u = static_cast<int>(gx);
@@ -128,12 +129,10 @@ double MultiChompNode::get_environment_distance(double x, double y, Eigen::Vecto
     double dx = dist_grad_x_.at<double>(v, u);
     double dy = dist_grad_y_.at<double>(v, u);
 
-    double norm = std::sqrt(dx * dx + dy * dy);
-    if (norm > 1e-5) {
-        gradient << dx / norm, dy / norm;
-    } else {
-        gradient << 0.0, 0.0;
-    }
+    // Convert Sobel pixel-gradient to metric gradient: d(dist)/d(x_m)
+    // Sobel is approximately d(dist)/d(pixel), so scale by 1/resolution
+    const double scale = (map_resolution_ > 1e-9) ? (1.0 / map_resolution_) : 0.0;
+    gradient << dx * scale, dy * scale;
 
     return static_cast<double>(dist);
 }
@@ -146,21 +145,15 @@ MultiChompNode::get_paths(const std::vector<nav_msgs::msg::Path> & templates) co
 
   const int nq = params_.waypoints_per_robot;
   
-  RCLCPP_INFO(this->get_logger(), 
-              "get_paths called: num_robots=%d, nq=%d, xidim_=%zu, xi_.size()=%ld",
-              params_.num_robots, nq, xidim_, xi_.size());
-  //guard against uninitialized optimizer state
+  // Guard against uninitialized optimizer state
   if (xidim_ == 0 || xi_.size() != static_cast<long>(xidim_)) {
-      RCLCPP_ERROR(this->get_logger(), 
-                   "Optimizer state invalid! xidim_=%zu, xi_.size()=%ld - returning empty paths",
-                   xidim_, xi_.size());
       return out; 
   }
 
   for (int r = 0; r < params_.num_robots; ++r) {
     nav_msgs::msg::Path path;
 
-    // use "map" frame and current time
+    // Use "map" frame and current time
     path.header.frame_id = "map"; 
     path.header.stamp = this->now();
 
@@ -171,30 +164,57 @@ MultiChompNode::get_paths(const std::vector<nav_msgs::msg::Path> & templates) co
       size_t idx = robot_offset + static_cast<size_t>(k) * cdim_;
       Eigen::Vector2d p = xi_.block(idx, 0, cdim_, 1);
 
-      // orientation
+      // --- SMOOTHER ORIENTATION CALCULATION ---
       double yaw = 0.0;
       
-      if (k < nq - 1) {
-          size_t idx_next = robot_offset + static_cast<size_t>(k + 1) * cdim_;
-          Eigen::Vector2d p_next = xi_.block(idx_next, 0, cdim_, 1);
-          
-          double dx = p_next.x() - p.x();
-          double dy = p_next.y() - p.y();
-          
-          if (dx*dx + dy*dy > 0.0001) {
-             yaw = std::atan2(dy, dx);
-          } else if (k > 0) {
-             size_t idx_prev = robot_offset + static_cast<size_t>(k - 1) * cdim_;
-             Eigen::Vector2d p_prev = xi_.block(idx_prev, 0, cdim_, 1);
-             yaw = std::atan2(p.y() - p_prev.y(), p.x() - p_prev.x());
+      // Look ahead/behind to find a point far enough away to get a stable angle
+      // We search up to 3 indices forward/backward
+      Eigen::Vector2d p_next = p;
+      Eigen::Vector2d p_prev = p;
+      bool found_next = false;
+      bool found_prev = false;
+
+      // Find next distinct point
+      for(int step = 1; step <= 3 && (k + step) < nq; ++step) {
+          size_t idx_n = robot_offset + static_cast<size_t>(k + step) * cdim_;
+          Eigen::Vector2d check = xi_.block(idx_n, 0, cdim_, 1);
+          if ((check - p).squaredNorm() > 0.01) { // > 10cm squared
+              p_next = check;
+              found_next = true;
+              break;
           }
-      } 
-      else if (k > 0) {
-          size_t idx_prev = robot_offset + static_cast<size_t>(k - 1) * cdim_;
-          Eigen::Vector2d p_prev = xi_.block(idx_prev, 0, cdim_, 1);
-          yaw = std::atan2(p.y() - p_prev.y(), p.x() - p_prev.x());
       }
-      
+
+      // Find prev distinct point
+      for(int step = 1; step <= 3 && (k - step) >= 0; ++step) {
+          size_t idx_p = robot_offset + static_cast<size_t>(k - step) * cdim_;
+          Eigen::Vector2d check = xi_.block(idx_p, 0, cdim_, 1);
+          if ((check - p).squaredNorm() > 0.01) {
+              p_prev = check;
+              found_prev = true;
+              break;
+          }
+      }
+
+      if (found_next && found_prev) {
+          // Central difference (smoothest)
+          yaw = std::atan2(p_next.y() - p_prev.y(), p_next.x() - p_prev.x());
+      } else if (found_next) {
+          // Forward difference (start of path)
+          yaw = std::atan2(p_next.y() - p.y(), p_next.x() - p.x());
+      } else if (found_prev) {
+          // Backward difference (end of path)
+          yaw = std::atan2(p.y() - p_prev.y(), p.x() - p_prev.x());
+      } else {
+          // No movement? Keep previous yaw or 0
+          if (k > 0) {
+              // Copy orientation from previous pose
+              const auto& prev_q = path.poses[k-1].pose.orientation;
+              // Extract yaw from quat ... simpler to just keep 0 if completely still
+          }
+      }
+      // ----------------------------------------
+
       // Convert Yaw to Quaternion
       double halfYaw = yaw * 0.5;
       double sz = std::sin(halfYaw);
@@ -214,14 +234,12 @@ MultiChompNode::get_paths(const std::vector<nav_msgs::msg::Path> & templates) co
       path.poses[k] = ps;
     }
 
-    RCLCPP_INFO(this->get_logger(), 
-                "Generated path for robot %d with %zu poses", r, path.poses.size());
-
     out[r] = std::move(path);
   }
 
   return out;
 }
+
 
 
 
@@ -351,6 +369,10 @@ bool MultiChompNode::set_paths(const std::vector<nav_msgs::msg::Path> & paths)
     }
   }
 
+  // Bias term so smoothness gradient is zero at the initial (Nav2) trajectory
+  // smooth_grad = AAR_*xi + bbR_ = AAR_*(xi - xi0)
+  bbR_ = -AAR_ * xi_;
+
   RCLCPP_INFO(this->get_logger(),
               "Loaded %d robot paths into optimizer state", params_.num_robots);
   return true;
@@ -376,9 +398,6 @@ void MultiChompNode::solve_step() {
             double dist = get_environment_distance(pt(0), pt(1), grad_env);
 
             if (dist < params_.obstacle_max_dist) {
-                // Cost: c(x) = (d_max - d(x))^2
-                // Gradient: dc/dx = -2*(d_max - d)*grad_d
-                // grad_env points away from obstacles, so we ADD to push away
                 double penetration = params_.obstacle_max_dist - dist;
                 nabla_obs.block(idx, 0, cdim_, 1) += 2.0 * penetration * VectorXd(grad_env);
             }
@@ -387,7 +406,7 @@ void MultiChompNode::solve_step() {
 
     // --- Robot-Robot Interference Gradients ---
     VectorXd nabla_inter = VectorXd::Zero(xidim_);
-    const double safety_dist = 2.0 * params_.robot_radius; // Consistent with cost
+    const double safety_dist = 2.0 * params_.robot_radius;
     
     for (int r1 = 0; r1 < params_.num_robots; ++r1) {
         for (int r2 = r1 + 1; r2 < params_.num_robots; ++r2) {
@@ -401,9 +420,6 @@ void MultiChompNode::solve_step() {
                 double dist = diff.norm();
 
                 if (dist < safety_dist && dist > 1e-6) {
-                    // Cost: c = (d_safe - ||p1-p2||)^2
-                    // Gradient w.r.t p1: dc/dp1 = -2*(d_safe - dist)*(p1-p2)/dist
-                    // Gradient w.r.t p2: dc/dp2 = +2*(d_safe - dist)*(p1-p2)/dist
                     double violation = safety_dist - dist;
                     VectorXd grad_force = 2.0 * violation * (diff / dist);
                     
@@ -414,45 +430,41 @@ void MultiChompNode::solve_step() {
         }
     }
 
-    // --- CHOMP Covariant Gradient Descent ---
-    // Workspace gradient (obstacles + interference)
+    // --- CHOMP update ---
     VectorXd nabla_U = nabla_obs + params_.mu * nabla_inter;
-    
-    // Full gradient including smoothness
-    VectorXd full_grad = params_.lambda * AAR_ * xi_ + nabla_U;
-    
-    // Covariant gradient step
+    VectorXd smooth_grad = params_.lambda * (AAR_ * xi_ + bbR_);
+    VectorXd full_grad = smooth_grad + nabla_U;
+    double grad_norm = full_grad.norm();
+    const double max_grad_norm = 5e4;
+    if (grad_norm > max_grad_norm) {
+      full_grad *= (max_grad_norm / grad_norm);
+    }
+
     VectorXd dxi = AARinv_ * full_grad;
     
-    // Update with step size
     xi_ -= (1.0 / params_.eta) * dxi;
 
-    // --- Soft Boundary Constraints ---
-    // Instead of hard reset, use strong attractive force toward start/goal
     const int nq = params_.waypoints_per_robot;
-    const double boundary_stiffness = 1000.0; // High stiffness
     
     for (int r = 0; r < params_.num_robots; ++r) {
         size_t robot_offset = static_cast<size_t>(r) * nq * cdim_;
-
-        // Start constraint
+        
+        // 1. Hard Reset Start (Index 0)
         if (r < static_cast<int>(start_states_.size())) {
             size_t start_idx = robot_offset;
-            VectorXd error = xi_.block(start_idx, 0, cdim_, 1) - start_states_[r];
-            xi_.block(start_idx, 0, cdim_, 1) -= boundary_stiffness * error / params_.eta;
+            xi_.block(start_idx, 0, cdim_, 1) = start_states_[r];
         }
 
-        // Goal constraint
+        // 2. Hard Reset Goal (Index nq-1)
         if (r < static_cast<int>(goal_states_.size())) {
             size_t goal_idx = robot_offset + static_cast<size_t>(nq - 1) * cdim_;
-            VectorXd error = xi_.block(goal_idx, 0, cdim_, 1) - goal_states_[r];
-            xi_.block(goal_idx, 0, cdim_, 1) -= boundary_stiffness * error / params_.eta;
+            xi_.block(goal_idx, 0, cdim_, 1) = goal_states_[r];
         }
     }
 
     publish_state();
-
 }
+
 
 double MultiChompNode::compute_current_cost() const {
   if (!map_received_) {
