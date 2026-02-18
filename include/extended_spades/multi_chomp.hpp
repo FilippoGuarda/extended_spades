@@ -28,6 +28,7 @@ struct ChompParameters {
     double obstacle_max_dist = 50.0;
     int num_robots = 2;
     int waypoints_per_robot = 20;
+    double nabla_ = 100.0;
 };
 
 class MultiChompNode : public rclcpp::Node {
@@ -77,7 +78,8 @@ private:
 
     size_t cdim_ = 2;
     size_t xidim_;
-    VectorXd xi_; // trajectory vector
+    VectorXd xi_;
+    VectorXd xi_init_;  // trajectory vector
     MatrixXd AA_; // cost matrix    
     MatrixXd AAR_; // multiple robots AA   
     MatrixXd AARinv_; // AAR inverse 

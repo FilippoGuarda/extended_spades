@@ -24,11 +24,12 @@ MultiChompNode::MultiChompNode() : Node("multi_chomp_server") {
 void MultiChompNode::load_parameters()
 {
     this->declare_parameter<int>("num_robots", 6);
-    this->declare_parameter<int>("waypoints_per_robot", 40);
+    this->declare_parameter<int>("waypoints_per_robot", 20);
     this->declare_parameter<double>("dt", 1.0);
     this->declare_parameter<double>("eta", 500.0);
-    this->declare_parameter<double>("lambda", 0.5);
+    this->declare_parameter<double>("lambda", 10.0);
     this->declare_parameter<double>("mu", 0.4);
+    this->declare_parameter<double>("alpha", 100.0);
     // assuming robot_radius and obstacle_max_dist are also parameters or constants
     params_.robot_radius = 0.5;
     params_.obstacle_max_dist = 4.0;
@@ -38,9 +39,11 @@ void MultiChompNode::load_parameters()
     params_.eta = this->get_parameter("eta").as_double();
     params_.lambda = this->get_parameter("lambda").as_double();
     params_.mu = this->get_parameter("mu").as_double();
+    params_.alpha = this->get_parameter("alpha").as_double();
 
     xidim_ = params_.num_robots * params_.waypoints_per_robot * cdim_;
     xi_  = VectorXd::Zero(xidim_);
+    xi_  = VectorXd::Zero(xi_init_);
     bbR_ = VectorXd::Zero(xidim_);
 }
 
@@ -93,8 +96,7 @@ void MultiChompNode::update_distance_map(const nav_msgs::msg::OccupancyGrid& gri
     for (int i = 0; i < map_height_; ++i) {
         for (int j = 0; j < map_width_; ++j) {
             int8_t val = grid.data[i * map_width_ + j];
-            // Treat unknown (-1) and occupied (>50) as obstacles
-            bin_img.at<uint8_t>(i, j) = (val < 0 || val > 50) ? 0 : 255;
+            bin_img.at<uint8_t>(i, j) = (val > 50) ? 0 : 255;
         }
     }
 
@@ -111,7 +113,7 @@ double MultiChompNode::get_environment_distance(double x, double y, Eigen::Vecto
 {
     if (dist_map_.empty()) {
         gradient << 0.0, 0.0;
-        return 0.0;
+        return 999.0;
     }
 
     double gx = (x - map_origin_x_) / map_resolution_;
@@ -119,7 +121,7 @@ double MultiChompNode::get_environment_distance(double x, double y, Eigen::Vecto
 
     if (gx < 1 || gx >= map_width_ - 1 || gy < 1 || gy >= map_height_ - 1) {
         gradient << 0.0, 0.0;
-        return 0.0;
+        return 999.0;
     }
 
     int u = static_cast<int>(gx);
@@ -371,156 +373,98 @@ bool MultiChompNode::set_paths(const std::vector<nav_msgs::msg::Path> & paths)
     }
   }
 
-  // Compute the "prior" bias term: bbR = -A * xi_initial
-  // This makes smoothness gradient = A*(xi - xi_initial), pulling optimization back to input path
-  bbR_ = -1.0 * AAR_ * xi_;
-
   RCLCPP_INFO(this->get_logger(),
               "Loaded %d robot paths into optimizer state", params_.num_robots);
+
+  // Store initial Nav2 trajectory for path fidelity
+  xi_init_ = xi_;
   return true;
 }
 
 
 void MultiChompNode::solve_step() {
-  if (!map_received_) {
-    return;
-  }
-
-  // --- Obstacle Gradients ---
-  VectorXd nabla_obs = VectorXd::Zero(xidim_);
-
-  {
-    std::lock_guard<std::mutex> lock(map_mutex_);
-    const int num_points = static_cast<int>(xidim_ / cdim_);
-
-    for (int i = 0; i < num_points; ++i) {
-      int idx = i * static_cast<int>(cdim_);
-      VectorXd pt = xi_.block(idx, 0, cdim_, 1);
-
-      Eigen::Vector2d grad_env;
-      double dist = get_environment_distance(pt(0), pt(1), grad_env);
-
-      // Obstacle cost: c(x) = 0.5 * max(0, obstacle_max_dist - dist)^2
-      // Gradient: dc/dx = -(obstacle_max_dist - dist) * grad_distance
-      // grad_env points AWAY from obstacles (towards free space)
-      // So the gradient points TOWARDS obstacles (increasing cost)
-      // We want to descend: xi -= learning_rate * gradient
-      // Therefore waypoints move AWAY from obstacles (correct)
-      if (dist < params_.obstacle_max_dist) {
-        double penetration = params_.obstacle_max_dist - dist;
-        // Gradient of cost w.r.t. position
-        nabla_obs.block(idx, 0, cdim_, 1) += -penetration * VectorXd(grad_env);
-      }
+    if (!map_received_) {
+        return;
     }
 
-    // --- Map Boundary Soft Constraints ---
-    // Prevent waypoints from escaping the map
-    const double boundary_margin = 0.5;
-    const double boundary_stiffness = 100.0; // Strong penalty
+    // --- Obstacle Gradients ---
+    VectorXd nabla_obs = VectorXd::Zero(xidim_);
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        const int num_points = static_cast<int>(xidim_ / cdim_);
+        
+        for (int i = 0; i < num_points; ++i) {
+            int idx = i * static_cast<int>(cdim_);
+            VectorXd pt = xi_.block(idx, 0, cdim_, 1);
+            
+            Eigen::Vector2d grad_env;
+            double dist = get_environment_distance(pt(0), pt(1), grad_env);
 
-    double x_min = map_origin_x_ + boundary_margin;
-    double x_max = map_origin_x_ + map_width_ * map_resolution_ - boundary_margin;
-    double y_min = map_origin_y_ + boundary_margin;
-    double y_max = map_origin_y_ + map_height_ * map_resolution_ - boundary_margin;
-
-    for (int i = 0; i < num_points; ++i) {
-      int idx = i * static_cast<int>(cdim_);
-      double x = xi_(idx);
-      double y = xi_(idx + 1);
-
-      // Quadratic penalty outside bounds
-      // Cost: 0.5 * k * (violation)^2
-      // Gradient: k * violation
-      if (x < x_min) {
-        nabla_obs(idx) += boundary_stiffness * (x - x_min);
-      } else if (x > x_max) {
-        nabla_obs(idx) += boundary_stiffness * (x - x_max);
-      }
-
-      if (y < y_min) {
-        nabla_obs(idx + 1) += boundary_stiffness * (y - y_min);
-      } else if (y > y_max) {
-        nabla_obs(idx + 1) += boundary_stiffness * (y - y_max);
-      }
-    }
-  }
-
-  // --- Robot-Robot Interference Gradients ---
-  VectorXd nabla_inter = VectorXd::Zero(xidim_);
-  const double safety_dist = 2.0 * params_.robot_radius;
-
-  for (int r1 = 0; r1 < params_.num_robots; ++r1) {
-    for (int r2 = r1 + 1; r2 < params_.num_robots; ++r2) {
-      for (int k = 0; k < params_.waypoints_per_robot; ++k) {
-        int idx1 = (r1 * params_.waypoints_per_robot + k) * static_cast<int>(cdim_);
-        int idx2 = (r2 * params_.waypoints_per_robot + k) * static_cast<int>(cdim_);
-
-        VectorXd p1 = xi_.block(idx1, 0, cdim_, 1);
-        VectorXd p2 = xi_.block(idx2, 0, cdim_, 1);
-        VectorXd diff = p1 - p2;
-        double dist = diff.norm();
-
-        if (dist < safety_dist && dist > 1e-6) {
-          // Cost: 0.5 * (safety_dist - dist)^2
-          // Gradient for p1: -(safety_dist - dist) * (p1 - p2) / |p1 - p2|
-          double violation = safety_dist - dist;
-          VectorXd grad_force = -violation * (diff / dist);
-
-          nabla_inter.block(idx1, 0, cdim_, 1) += grad_force;
-          nabla_inter.block(idx2, 0, cdim_, 1) -= grad_force;
+            if (dist < params_.obstacle_max_dist) {
+                double penetration = params_.obstacle_max_dist - dist;
+                nabla_obs.block(idx, 0, cdim_, 1) += 2.0 * penetration * VectorXd(grad_env);
+            }
         }
-      }
-    }
-  }
-
-  // --- CHOMP Covariant Gradient Update ---
-
-  // Smoothness gradient relative to initial path:
-  // Grad_smooth = A * (xi - xi_initial) = A * xi + bbR
-  // where bbR = -A * xi_initial (computed in set_paths)
-  VectorXd nabla_smooth = AAR_ * xi_ + bbR_;
-
-  // Total gradient (obstacle + interference + smoothness)
-  // Note: lambda scales the smoothness weight
-  VectorXd nabla_U = nabla_obs + params_.mu * nabla_inter;
-  VectorXd full_grad = nabla_U + params_.lambda * nabla_smooth;
-
-  // Optional: Clip gradient to prevent explosive updates
-  double grad_norm = full_grad.norm();
-  const double max_grad_norm = 1e5;
-  if (grad_norm > max_grad_norm) {
-    full_grad *= (max_grad_norm / grad_norm);
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-      "Gradient norm %.1f exceeded limit, clipping", grad_norm);
-  }
-
-  // Apply the metric (covariance) inverse to the gradient
-  VectorXd dxi = AARinv_ * full_grad;
-
-  // Gradient descent update
-  // eta is the step size parameter (larger eta = smaller steps)
-  xi_ -= (1.0 / params_.eta) * dxi;
-
-  // --- Hard Constraints: Fix Start and Goal ---
-  const int nq = params_.waypoints_per_robot;
-
-  for (int r = 0; r < params_.num_robots; ++r) {
-    size_t robot_offset = static_cast<size_t>(r) * nq * cdim_;
-
-    // Reset start waypoint (index 0)
-    if (r < static_cast<int>(start_states_.size())) {
-      size_t start_idx = robot_offset;
-      xi_.block(start_idx, 0, cdim_, 1) = start_states_[r];
     }
 
-    // Reset goal waypoint (index nq-1)
-    if (r < static_cast<int>(goal_states_.size())) {
-      size_t goal_idx = robot_offset + static_cast<size_t>(nq - 1) * cdim_;
-      xi_.block(goal_idx, 0, cdim_, 1) = goal_states_[r];
+    // --- Robot-Robot Interference Gradients ---
+    VectorXd nabla_inter = VectorXd::Zero(xidim_);
+    const double safety_dist = 2.0 * params_.robot_radius;
+    
+    for (int r1 = 0; r1 < params_.num_robots; ++r1) {
+        for (int r2 = r1 + 1; r2 < params_.num_robots; ++r2) {
+            for (int k = 0; k < params_.waypoints_per_robot; ++k) {
+                int idx1 = (r1 * params_.waypoints_per_robot + k) * static_cast<int>(cdim_);
+                int idx2 = (r2 * params_.waypoints_per_robot + k) * static_cast<int>(cdim_);
+
+                VectorXd p1 = xi_.block(idx1, 0, cdim_, 1);
+                VectorXd p2 = xi_.block(idx2, 0, cdim_, 1);
+                VectorXd diff = p1 - p2;
+                double dist = diff.norm();
+
+                if (dist < safety_dist && dist > 1e-6) {
+                    double violation = safety_dist - dist;
+                    VectorXd grad_force = 2.0 * violation * (diff / dist);
+                    
+                    nabla_inter.block(idx1, 0, cdim_, 1) -= grad_force;
+                    nabla_inter.block(idx2, 0, cdim_, 1) += grad_force;
+                }
+            }
+        }
     }
+
+    // --- CHOMP update ---
+    VectorXd nabla_U = nabla_obs + params_.mu * nabla_inter;
+    // Path fidelity: anchor to initial Nav2 trajectory
+  VectorXd nabla_fidelity = VectorXd::Zero(xidim_);
+  if (xi_init_.size() == static_cast<long>(xidim_)) {
+    nabla_fidelity = params_.alpha * (xi_ - xi_init_);
   }
 
-  publish_state();
+  VectorXd full_grad = params_.lambda * AAR_ * xi_ + nabla_U + nabla_fidelity;
+    VectorXd dxi = AARinv_ * full_grad;
+    
+    xi_ -= (1.0 / params_.eta) * dxi;
+
+    const int nq = params_.waypoints_per_robot;
+    
+    for (int r = 0; r < params_.num_robots; ++r) {
+        size_t robot_offset = static_cast<size_t>(r) * nq * cdim_;
+        
+        // 1. Hard Reset Start (Index 0)
+        if (r < static_cast<int>(start_states_.size())) {
+            size_t start_idx = robot_offset;
+            xi_.block(start_idx, 0, cdim_, 1) = start_states_[r];
+        }
+
+        // 2. Hard Reset Goal (Index nq-1)
+        if (r < static_cast<int>(goal_states_.size())) {
+            size_t goal_idx = robot_offset + static_cast<size_t>(nq - 1) * cdim_;
+            xi_.block(goal_idx, 0, cdim_, 1) = goal_states_[r];
+        }
+    }
+
+    publish_state();
 }
 
 
