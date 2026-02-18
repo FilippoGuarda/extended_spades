@@ -14,7 +14,7 @@ MultiChompNode::MultiChompNode() : Node("multi_chomp_server") {
 
   // occupancy grid subscription
   grid_sub_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
-    "/global_costmap/costmap", map_qos, std::bind(&MultiChompNode::map_callback, this, _1));
+    "/robot1/global_costmap/costmap", map_qos, std::bind(&MultiChompNode::map_callback, this, _1));
 
   RCLCPP_INFO(this->get_logger(), "Multi-CHOMP server initialized for %d robots", params_.num_robots);
 }
@@ -46,27 +46,34 @@ void MultiChompNode::load_parameters()
 }
 
 void MultiChompNode::init_matrices() {
-  // single robot metric A from waypoints
   size_t nq = params_.waypoints_per_robot;
-  AA_ = MatrixXd::Zero(nq*cdim_, nq*cdim_);
 
-  for (size_t i=0; i < nq; ++i) {
+  // Single robot metric
+  AA_ = MatrixXd::Zero(nq * cdim_, nq * cdim_);
+  for (size_t i = 0; i < nq; ++i) {
     AA_.block(cdim_ * i, cdim_ * i, cdim_, cdim_) = 2.0 * MatrixXd::Identity(cdim_, cdim_);
-    
     if (i > 0) {
       AA_.block(cdim_ * (i - 1), cdim_ * i, cdim_, cdim_) = -1.0 * MatrixXd::Identity(cdim_, cdim_);
       AA_.block(cdim_ * i, cdim_ * (i - 1), cdim_, cdim_) = -1.0 * MatrixXd::Identity(cdim_, cdim_);
     }
   }
 
-  // now create multi robot metric
+  // Multi-robot block-diagonal metric
+  // Use TOTAL waypoint count in denominator, matching Philippsen reference
+  size_t total_nq = static_cast<size_t>(params_.num_robots) * nq;
   AAR_ = MatrixXd::Zero(xidim_, xidim_);
   for (int k = 0; k < params_.num_robots; ++k) {
     size_t offset = static_cast<size_t>(k) * nq * cdim_;
     AAR_.block(offset, offset, nq * cdim_, nq * cdim_) = AA_;
   }
-  AAR_ /= (params_.dt * params_.dt * (nq + 1));
-  AARinv_ = AAR_.inverse();
+  AAR_ /= (params_.dt * params_.dt * (total_nq + 1));
+
+  // Per-robot interior-only preconditioner
+  // Strip boundary rows/cols (k=0 and k=nq-1) from AA_ before inverting
+  // This prevents dense corner entries from corrupting interior gradient updates
+  size_t interior_dim = (nq - 2) * cdim_;
+  MatrixXd AA_interior = AA_.block(cdim_, cdim_, interior_dim, interior_dim);
+  AAinv_interior_ = AA_interior.inverse();
 }
 
 void MultiChompNode::map_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
@@ -86,9 +93,15 @@ void MultiChompNode::update_distance_map(const nav_msgs::msg::OccupancyGrid& gri
 
   cv::Mat bin_img(map_height_, map_width_, CV_8UC1);
 
+  // ROS OccupancyGrid row 0 = bottom of map (y = origin_y)
+  // OpenCV row 0 = top of image
+  // Flip row index so that cv pixel (col=j, row=i) corresponds to
+  // world coordinates (x = origin_x + j*res, y = origin_y + i*res)
   for (int i = 0; i < map_height_; ++i) {
+    int ros_row = (map_height_ - 1) - i;  // flip vertical axis
     for (int j = 0; j < map_width_; ++j) {
-      int8_t val = grid.data[i * map_width_ + j];
+      int8_t val = grid.data[ros_row * map_width_ + j];
+      // Unknown cells (val == -1) treated as free to avoid spurious repulsion
       bin_img.at<uint8_t>(i, j) = (val > 50) ? 0 : 255;
     }
   }
@@ -96,11 +109,17 @@ void MultiChompNode::update_distance_map(const nav_msgs::msg::OccupancyGrid& gri
   cv::Mat dist_img_pixels;
   cv::distanceTransform(bin_img, dist_img_pixels, cv::DIST_L2, 5);
 
-  dist_map_ = dist_img_pixels * map_resolution_;
+  // Force CV_64F throughout for consistent reads in get_environment_distance
+  dist_img_pixels.convertTo(dist_map_, CV_64F, map_resolution_);
 
   cv::Sobel(dist_map_, dist_grad_x_, CV_64F, 1, 0, 3);
   cv::Sobel(dist_map_, dist_grad_y_, CV_64F, 0, 1, 3);
+
+  // Sobel dy is in image coordinates (row increases downward)
+  // but world y increases upward — flip the y gradient sign
+  dist_grad_y_ = -dist_grad_y_;
 }
+
 
 double MultiChompNode::get_environment_distance(double x, double y, Eigen::Vector2d& gradient) const
 {
@@ -109,8 +128,10 @@ double MultiChompNode::get_environment_distance(double x, double y, Eigen::Vecto
     return 999.0;
   }
 
+  // World to image pixel coordinates
+  // Image row 0 = world y_max (after flip in update_distance_map)
   double gx = (x - map_origin_x_) / map_resolution_;
-  double gy = (y - map_origin_y_) / map_resolution_;
+  double gy = (double)(map_height_ - 1) - (y - map_origin_y_) / map_resolution_;
 
   if (gx < 1 || gx >= map_width_ - 1 || gy < 1 || gy >= map_height_ - 1) {
     gradient << 0.0, 0.0;
@@ -120,9 +141,10 @@ double MultiChompNode::get_environment_distance(double x, double y, Eigen::Vecto
   int u = static_cast<int>(gx);
   int v = static_cast<int>(gy);
 
-  float dist = dist_map_.at<float>(v, u);
-  double dx = dist_grad_x_.at<double>(v, u);
-  double dy = dist_grad_y_.at<double>(v, u);
+  // Both dist_map_ and gradients are now CV_64F
+  double dist = dist_map_.at<double>(v, u);
+  double dx   = dist_grad_x_.at<double>(v, u);
+  double dy   = dist_grad_y_.at<double>(v, u);
 
   double norm = std::sqrt(dx * dx + dy * dy);
   if (norm > 1e-5) {
@@ -131,7 +153,7 @@ double MultiChompNode::get_environment_distance(double x, double y, Eigen::Vecto
     gradient << 0.0, 0.0;
   }
 
-  return static_cast<double>(dist);
+  return dist;
 }
 
 std::vector<nav_msgs::msg::Path>
@@ -278,7 +300,7 @@ MultiChompNode::resample_path(const nav_msgs::msg::Path & path, int num_points) 
   return out;
 }
 
-bool MultiChompNode::set_paths(const std::vector<nav_msgs::msg::Path> & paths)
+bool MultiChompNode::set_paths(const std::vector<nav_msgs::msg::Path>& paths)
 {
   int new_num_robots = static_cast<int>(paths.size());
   const int nq = params_.waypoints_per_robot;
@@ -288,125 +310,125 @@ bool MultiChompNode::set_paths(const std::vector<nav_msgs::msg::Path> & paths)
     return false;
   }
 
+  // Only resize state vectors, never reinvoke init_matrices()
+  // init_matrices() depends only on nq and cdim_, not num_robots
   if (new_num_robots != params_.num_robots) {
-    RCLCPP_INFO(this->get_logger(), "Resizing optimizer state for %d robots", new_num_robots);
+    RCLCPP_INFO(this->get_logger(), "Resizing for %d robots", new_num_robots);
     params_.num_robots = new_num_robots;
-    xidim_ = params_.num_robots * nq * cdim_;
-    xi_ = VectorXd::Zero(xidim_);
-    xi_init_ = VectorXd::Zero(xidim_);
-    bbR_ = VectorXd::Zero(xidim_);
-    start_states_.resize(params_.num_robots);
-    goal_states_.resize(params_.num_robots);
-    init_matrices();
-  }
+    xidim_ = static_cast<size_t>(params_.num_robots) * nq * cdim_;
 
-  if (start_states_.size() != static_cast<size_t>(params_.num_robots)) {
+    // Preserve existing trajectories by resizing, not zeroing
+    xi_.conservativeResizeLike(VectorXd::Zero(xidim_));
+    xi_init_.conservativeResizeLike(VectorXd::Zero(xidim_));
+    bbR_.conservativeResizeLike(VectorXd::Zero(xidim_));
+
     start_states_.resize(params_.num_robots);
     goal_states_.resize(params_.num_robots);
+
+    // Rebuild AAR_ for new robot count but keep AAinv_interior_ unchanged
+    size_t total_nq = static_cast<size_t>(params_.num_robots) * nq;
+    AAR_ = MatrixXd::Zero(xidim_, xidim_);
+    for (int k = 0; k < params_.num_robots; ++k) {
+      size_t offset = static_cast<size_t>(k) * nq * cdim_;
+      AAR_.block(offset, offset, nq * cdim_, nq * cdim_) = AA_;
+    }
+    AAR_ /= (params_.dt * params_.dt * (total_nq + 1));
   }
 
   for (int r = 0; r < params_.num_robots; ++r) {
-    const auto & path = paths[r];
+    const auto& path = paths[r];
     if (path.poses.size() < 2) {
       RCLCPP_ERROR(this->get_logger(), "set_paths: robot %d path has < 2 poses", r);
       return false;
     }
 
-    // Store start and goal
-    const auto & p_start = path.poses.front().pose.position;
-    const auto & p_goal = path.poses.back().pose.position;
+    const auto& p_start = path.poses.front().pose.position;
+    const auto& p_goal  = path.poses.back().pose.position;
     start_states_[r] = Eigen::Vector2d(p_start.x, p_start.y);
-    goal_states_[r] = Eigen::Vector2d(p_goal.x, p_goal.y);
+    goal_states_[r]  = Eigen::Vector2d(p_goal.x,  p_goal.y);
 
-    // Resample path to nq waypoints
     auto samples = resample_path(path, nq);
     if (static_cast<int>(samples.size()) != nq) {
       RCLCPP_ERROR(this->get_logger(), "set_paths: resample failed for robot %d", r);
       return false;
     }
 
-    // Pack into xi_ AND xi_init_
     size_t robot_offset = static_cast<size_t>(r) * nq * cdim_;
     for (int k = 0; k < nq; ++k) {
       size_t idx = robot_offset + static_cast<size_t>(k) * cdim_;
-      xi_.block(idx, 0, cdim_, 1) = samples[k];
-      xi_init_.block(idx, 0, cdim_, 1) = samples[k];  // NEW: Store initial path
+      xi_.block(idx, 0, cdim_, 1)      = samples[k];
+      xi_init_.block(idx, 0, cdim_, 1) = samples[k];
     }
   }
 
-  RCLCPP_INFO(this->get_logger(), "Loaded %d robot paths into optimizer state", params_.num_robots);
+  RCLCPP_INFO(this->get_logger(), "Loaded %d robot paths", params_.num_robots);
   return true;
 }
 
 void MultiChompNode::solve_step() {
+
   if (!map_received_) return;
 
+  // log possible problem with xidim initialization
+  RCLCPP_INFO_ONCE(this->get_logger(),
+    "solve_step called, map_received=%s, xidim=%zu",
+    map_received_ ? "true" : "false", xidim_);
+
+  if (!map_received_) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+      "solve_step: waiting for map");
+    return;
+  }
   const int nq = params_.waypoints_per_robot;
   const double dt = params_.dt;
-  const double scaling_factor = 1.0 / (dt * dt * (nq + 1));
 
-  // 1. Recompute bbR (Bias for start/end points)
+  // Use total waypoint count in denominator, consistent with init_matrices()
+  const size_t total_nq = static_cast<size_t>(params_.num_robots) * nq;
+  const double scaling_factor = 1.0 / (dt * dt * (total_nq + 1));
+
+  // 1. Recompute bbR_ — boundary term at adjacent-to-endpoint slots only
   bbR_ = VectorXd::Zero(xidim_);
   for (int r = 0; r < params_.num_robots; ++r) {
-    size_t robot_offset = static_cast<size_t>(r) * nq * cdim_;
-    
-    if (r < static_cast<int>(start_states_.size())) {
-      bbR_.block(robot_offset, 0, cdim_, 1) = start_states_[r];
-    }
-    
-    if (r < static_cast<int>(goal_states_.size())) {
-      size_t end_idx = robot_offset + static_cast<size_t>(nq - 1) * cdim_;
-      bbR_.block(end_idx, 0, cdim_, 1) = goal_states_[r];
-    }
+    size_t ro = static_cast<size_t>(r) * nq * cdim_;
+    bbR_.block(ro + 1 * cdim_, 0, cdim_, 1) =
+        -scaling_factor * start_states_[r];
+    bbR_.block(ro + static_cast<size_t>(nq - 2) * cdim_, 0, cdim_, 1) =
+        -scaling_factor * goal_states_[r];
   }
-  bbR_ *= -scaling_factor;
 
-  // 2. Path Fidelity Gradient (NEW)
-  // nabla_fidelity = α * (ξ - ξ_init)
+  // 2. Fidelity gradient
   VectorXd nabla_fidelity = params_.alpha * (xi_ - xi_init_);
 
-  // 3. Smoothness Gradient (Unprojected, scaled by λ)
-  // nabla_smooth = λ * (AAR * ξ + bbR)
+  // 3. Smoothness gradient
   VectorXd nabla_smooth = params_.lambda * (AAR_ * xi_ + bbR_);
 
-  // 4. Obstacle & Interference Gradients
-  VectorXd nabla_obs = VectorXd::Zero(xidim_);
+  // 4. Obstacle & Interference gradients
+  VectorXd nabla_obs   = VectorXd::Zero(xidim_);
   VectorXd nabla_inter = VectorXd::Zero(xidim_);
 
   for (int r = 0; r < params_.num_robots; ++r) {
     size_t offset = static_cast<size_t>(r) * nq * cdim_;
-    VectorXd start_p = start_states_[r];
-    VectorXd end_p = goal_states_[r];
 
-    for (int i = 0; i < nq; ++i) {
+    for (int i = 1; i < nq - 1; ++i) {
       int idx = offset + i * cdim_;
       VectorXd qq = xi_.block(idx, 0, cdim_, 1);
 
-      // Velocity (Central Difference)
-      VectorXd qd = VectorXd::Zero(cdim_);
-      if (i == 0) {
-        VectorXd q_next = xi_.block(idx + cdim_, 0, cdim_, 1);
-        qd = (q_next - start_p) / (2.0 * dt);
-      } else if (i == nq - 1) {
-        VectorXd q_prev = xi_.block(idx - cdim_, 0, cdim_, 1);
-        qd = (end_p - q_prev) / (2.0 * dt);
-      } else {
-        VectorXd q_next = xi_.block(idx + cdim_, 0, cdim_, 1);
-        VectorXd q_prev = xi_.block(idx - cdim_, 0, cdim_, 1);
-        qd = (q_next - q_prev) / (2.0 * dt);
-      }
+      // Velocity via central difference; boundary-adjacent points use
+      // clamped xi_[0]/xi_[nq-1] which equals start/goal — correct
+      VectorXd q_next = xi_.block(idx + cdim_, 0, cdim_, 1);
+      VectorXd q_prev = xi_.block(idx - cdim_, 0, cdim_, 1);
+      VectorXd qd = (q_next - q_prev) / (2.0 * dt);
 
       double vel = qd.norm();
       if (vel < 1.0e-3) continue;
 
-            VectorXd xdn = qd / vel;
+      VectorXd xdn = qd / vel;
       Eigen::Matrix2d prj = Eigen::Matrix2d::Identity() - xdn * xdn.transpose();
 
-      // Acceleration (from smoothness gradient)
-      VectorXd xdd = nabla_smooth.block(idx, 0, cdim_, 1);
-      VectorXd kappa = (prj * xdd) / (vel * vel);
+      VectorXd q_acc = (q_next - 2.0 * qq + q_prev) / (dt * dt);
+      VectorXd kappa = (prj * q_acc) / (vel * vel);
 
-      // --- Obstacle Cost ---
+      // --- Obstacle gradient ---
       Eigen::Vector2d grad_env;
       double dist = get_environment_distance(qq(0), qq(1), grad_env);
 
@@ -418,9 +440,13 @@ void MultiChompNode::solve_step() {
         nabla_obs.block(idx, 0, cdim_, 1) += vel * (prj * delta - cost * kappa);
       }
 
-      // --- Interference Cost ---
+      // --- Interference gradient ---
+      // Boundary weight: 0 at i=1 and i=nq-2, 1 at midpoint
+      // Prevents fixed start/goal proximity from triggering outward repulsion
+      double t = static_cast<double>(i) / static_cast<double>(nq - 1);
+      double boundary_weight = std::min(t, 1.0 - t) * 2.0;
+
       const double safety_dist = 2.0 * params_.robot_radius;
-      const double gain_R = 1.0;
 
       for (int r2 = 0; r2 < params_.num_robots; ++r2) {
         if (r == r2) continue;
@@ -430,61 +456,66 @@ void MultiChompNode::solve_step() {
         double dd_norm = diff.norm();
 
         if (dd_norm < safety_dist && dd_norm > 1e-9) {
-          double term_R = 1.0 - dd_norm / safety_dist;
-          double cost_R = gain_R * safety_dist * pow(term_R, 3.0) / 3.0;
-          VectorXd delta_R = -gain_R * pow(term_R, 2.0) * (diff / dd_norm);
-          nabla_inter.block(idx, 0, cdim_, 1) += vel * (prj * delta_R - cost_R * kappa);
+          double term_R   = 1.0 - dd_norm / safety_dist;
+          double cost_R   = safety_dist * pow(term_R, 3.0) / 3.0;
+          VectorXd delta_R = -pow(term_R, 2.0) * (diff / dd_norm);
+          nabla_inter.block(idx, 0, cdim_, 1) +=
+              boundary_weight * vel * (prj * delta_R - cost_R * kappa);
         }
       }
     }
   }
 
-  // 5. Combined Gradient (NEW FORMULATION)
-  // ∇J = α(ξ - ξ_init) + λ(Aξ + b) + ∇obs + μ∇int
-  VectorXd full_grad = nabla_fidelity + nabla_smooth + nabla_obs + params_.mu * nabla_inter;
+  // 5. Combined gradient
+  VectorXd full_grad = nabla_fidelity + nabla_smooth + nabla_obs +
+                       params_.mu * nabla_inter;
 
-  // Clip gradient
-  double g_norm = full_grad.norm();
-  if (g_norm > 1e6) {
-    full_grad *= (1e6 / g_norm);
-  }
-
-  // 6. Update Step
-  VectorXd dxi = AARinv_ * full_grad;
-  xi_ -= dxi * params_.eta;
-
-  // 7. Hard Constraints (Start/Goal)
+  // Zero start/goal slots — interior preconditioner does not touch them anyway
   for (int r = 0; r < params_.num_robots; ++r) {
     size_t offset = static_cast<size_t>(r) * nq * cdim_;
-    
-    if (r < static_cast<int>(start_states_.size())) {
-      xi_.block(offset, 0, cdim_, 1) = start_states_[r];
-    }
-    
-    if (r < static_cast<int>(goal_states_.size())) {
-      size_t end_idx = offset + (nq-1)*cdim_;
-      xi_.block(end_idx, 0, cdim_, 1) = goal_states_[r];
-    }
+    full_grad.block(offset, 0, cdim_, 1).setZero();
+    full_grad.block(offset + static_cast<size_t>(nq - 1) * cdim_, 0, cdim_, 1).setZero();
   }
 
-  // 8. Map Boundary Constraints
+  double g_norm = full_grad.norm();
+  if (g_norm > 1e6) full_grad *= (1e6 / g_norm);
+
+  // 6. Per-robot interior-only preconditioning
+  // Only the interior block (k=1..nq-2) is preconditioned using AA_interior inverse
+  // Boundary rows are excluded to prevent dense corner entries from
+  // redistributing gradient into start/goal-adjacent waypoints
+  VectorXd dxi = VectorXd::Zero(xidim_);
+  size_t interior_dim = static_cast<size_t>(nq - 2) * cdim_;
+  for (int r = 0; r < params_.num_robots; ++r) {
+    size_t offset = static_cast<size_t>(r) * nq * cdim_;
+    VectorXd grad_interior = full_grad.block(offset + cdim_, 0, interior_dim, 1);
+    dxi.block(offset + cdim_, 0, interior_dim, 1) = AAinv_interior_ * grad_interior;
+  }
+
+  xi_ -= dxi * params_.eta;
+
+  // 7. Hard constraints — enforce start/goal every iteration
+  for (int r = 0; r < params_.num_robots; ++r) {
+    size_t offset = static_cast<size_t>(r) * nq * cdim_;
+    xi_.block(offset, 0, cdim_, 1) = start_states_[r];
+    xi_.block(offset + static_cast<size_t>(nq - 1) * cdim_, 0, cdim_, 1) = goal_states_[r];
+  }
+
+  // 8. Map boundary clamp on interior waypoints
   if (!dist_map_.empty()) {
-    const double safety_margin = params_.robot_radius;
-    double map_min_x = map_origin_x_ + safety_margin;
-    double map_max_x = map_origin_x_ + (map_width_ * map_resolution_) - safety_margin;
-    double map_min_y = map_origin_y_ + safety_margin;
-    double map_max_y = map_origin_y_ + (map_height_ * map_resolution_) - safety_margin;
-    
+    const double margin = params_.robot_radius;
+    const double min_x = map_origin_x_ + margin;
+    const double max_x = map_origin_x_ + map_width_  * map_resolution_ - margin;
+    const double min_y = map_origin_y_ + margin;
+    const double max_y = map_origin_y_ + map_height_ * map_resolution_ - margin;
+
     for (int r = 0; r < params_.num_robots; ++r) {
       size_t offset = static_cast<size_t>(r) * nq * cdim_;
       for (int k = 1; k < nq - 1; ++k) {
-        size_t idx = offset + static_cast<size_t>(k) * cdim_;
-        double& x = xi_(idx);
-        double& y = xi_(idx + 1);
-        if (x < map_min_x) x = map_min_x;
-        if (x > map_max_x) x = map_max_x;
-        if (y < map_min_y) y = map_min_y;
-        if (y > map_max_y) y = map_max_y;
+        double & x = xi_(offset + k * cdim_);
+        double & y = xi_(offset + k * cdim_ + 1);
+        x = std::max(min_x, std::min(max_x, x));
+        y = std::max(min_y, std::min(max_y, y));
       }
     }
   }

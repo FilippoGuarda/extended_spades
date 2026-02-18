@@ -83,6 +83,9 @@ private:
     VectorXd xi_;  // trajectory vector
     VectorXd xi_init_;  
     MatrixXd AA_; // cost matrix    
+    MatrixXd AAinv_; // cost matrix inverse
+    MatrixXd AA_interior;
+    MatrixXd AAinv_interior_; 
     MatrixXd AAR_; // multiple robots AA   
     MatrixXd AARinv_; // AAR inverse 
     VectorXd bbR_; // acceleration bias
