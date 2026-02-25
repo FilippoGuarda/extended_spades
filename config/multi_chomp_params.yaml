@@ -3,7 +3,7 @@ multi_chomp_node:
     num_robots: 6
     waypoints_per_robot: 1000
     dt: 1.0
-    eta: 500.0        # learning rate
+    eta: 0.5        # learning rate
     lambda: 10.0       # smoothness 
     mu: 100.0          # Obstacle/Collision weight
     robot_radius: 0.4

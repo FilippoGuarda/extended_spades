@@ -42,7 +42,7 @@ public:
   int get_num_robots() const { return params_.num_robots; }
 
   // multi chomp accessors
-    // start with imput global paths (computed with nav2)
+  // start with imput global paths (computed with nav2)
   bool set_paths(const std::vector<nav_msgs::msg::Path> & paths);
   bool has_map() const { return map_received_; };
   double compute_current_cost() const;
@@ -55,14 +55,11 @@ private:
   // visualization publisher
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
 
-    // loop timer
-    // rclcpp::TimerBase::SharedPtr timer_;
-
   // costmap subscriber
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr grid_sub_;
 
   // state protection lock
-  std::mutex map_mutex_;
+  mutable std::mutex map_mutex_;
   nav_msgs::msg::OccupancyGrid current_map_;
   bool map_received_ = false;
 
@@ -80,27 +77,27 @@ private:
 
   size_t cdim_ = 2;
   size_t xidim_;
-    VectorXd xi_;  // trajectory vector
-    VectorXd xi_init_;  
-    MatrixXd AA_; // cost matrix    
-    MatrixXd AAinv_; // cost matrix inverse
-    MatrixXd AA_interior;
-    MatrixXd AAinv_interior_; 
-    MatrixXd AAR_; // multiple robots AA   
-    MatrixXd AARinv_; // AAR inverse 
-    VectorXd bbR_; // acceleration bias
+  VectorXd xi_;  // trajectory vector
+  VectorXd xi_init_;  
+  MatrixXd AA_; // cost matrix    
+  MatrixXd AAinv_; // cost matrix inverse
+  MatrixXd AA_interior;
+  MatrixXd AAinv_interior_; 
+  MatrixXd AAR_; // multiple robots AA   
+  MatrixXd AARinv_; // AAR inverse 
+  VectorXd bbR_; // acceleration bias
 
   // state scenarios
   std::vector<Vector2d> start_states_;
   std::vector<Vector2d> goal_states_;
-    // extend a provided path into a fixed number of waypoints
+  // extend a provided path into a fixed number of waypoints
   std::vector<Vector2d> resample_path(const nav_msgs::msg::Path & path, int num_points) const;
 
   void map_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
 
   double get_environment_distance(double x, double y, Eigen::Vector2d& gradient) const;
 
-    // helpers initialization
+  // helpers initialization
   void load_parameters();
   void init_matrices();
 

@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <thread>
+#include <atomic>
 
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
@@ -25,6 +26,8 @@ private:
     rclcpp_action::Server<MultiChompOptimize>::SharedPtr action_server_;
 
     std::shared_ptr<MultiChompNode> optimizer_; 
+
+    std::atomic<bool> is_optimizing_;
 
     rclcpp_action::GoalResponse handle_goal(
         const rclcpp_action::GoalUUID & uuid,

@@ -237,63 +237,17 @@ class FleetCoordinator(Node):
 
             self.get_logger().info("Optimization Complete. Distributing paths...")
 
-            # Iterate over ALL robots
             for i, robot_name in enumerate(self.robot_names):
                 opt_path = optimized_paths[i]
                 
                 if len(opt_path.poses) < 2:
                     continue
-
-                # --- VALIDATION & EXECUTION LOGIC ---
-                # We execute the path if:
-                # 1. The robot explicitly requested a goal (it's in self.goals)
-                # 2. OR: The path implies significant movement (CHOMP nudged it)
-                # For safety/simplicity, we execute ALL paths that look valid.
                 
-                # Check for Inversion (End closer than Start)
-                robot_pose = self.get_robot_pose(robot_name)
-                if robot_pose:
-                    rx, ry = robot_pose.pose.position.x, robot_pose.pose.position.y
-                    sx, sy = opt_path.poses[0].pose.position.x, opt_path.poses[0].pose.position.y
-                    ex, ey = opt_path.poses[-1].pose.position.x, opt_path.poses[-1].pose.position.y
-                    
-                    dist_start = math.hypot(sx - rx, sy - ry)
-                    dist_end = math.hypot(ex - rx, ey - ry)
-                    
-                    if dist_end < dist_start and dist_end < 1.0:
-                        self.get_logger().info(f"Fixing inverted path for {robot_name}")
-                        opt_path.poses.reverse()
-                        
-                        # Recompute orientations for reversed path
-                        for i in range(len(opt_path.poses)):
-                            if i < len(opt_path.poses) - 1:
-                                # Forward difference: direction to next pose
-                                p_curr = opt_path.poses[i].pose.position
-                                p_next = opt_path.poses[i + 1].pose.position
-                                yaw = math.atan2(p_next.y - p_curr.y, p_next.x - p_curr.x)
-                            else:
-                                # Last pose: copy orientation from previous
-                                yaw = math.atan2(
-                                    opt_path.poses[i].pose.position.y - opt_path.poses[i-1].pose.position.y,
-                                    opt_path.poses[i].pose.position.x - opt_path.poses[i-1].pose.position.x
-                                )
-                            
-                            # Convert yaw to quaternion
-                            half_yaw = yaw * 0.5
-                            opt_path.poses[i].pose.orientation.x = 0.0
-                            opt_path.poses[i].pose.orientation.y = 0.0
-                            opt_path.poses[i].pose.orientation.z = math.sin(half_yaw)
-                            opt_path.poses[i].pose.orientation.w = math.cos(half_yaw)
-                    elif dist_start > 2.0:
-
-                         self.get_logger().error(f"Path for {robot_name} detached (gap={dist_start:.2f}m). Ignoring.")
-                         continue
-
-                self.execute_path(robot_name, opt_path)
+                
+                # Only execute if the robot was actually supposed to move
+                if robot_name in self.goals or robot_name in self.new_plan_buffer:
+                    self.execute_path(robot_name, opt_path)
             
-            # Reset active goals
-            # Note: We clear goals so we don't re-request plans, 
-            # but we keep monitoring.
             self.goals.clear()
             self.new_plan_buffer.clear()
             self.optimization_in_progress = False
@@ -302,20 +256,12 @@ class FleetCoordinator(Node):
             self.get_logger().error(f"Optimization callback exception: {e}")
             self.optimization_in_progress = False
 
+
     def execute_path(self, robot_name, path):
         client = self.nav2_exec_clients.get(robot_name)
         if not client: return
 
-        # Get current robot pose
-        robot_pose = self.get_robot_pose(robot_name)
-        if not robot_pose:
-            self.get_logger().warn(f"Cannot execute path for {robot_name}: No TF")
-            return
-
-        # Prepend current pose to ensure MPPI can track from current location
-        path.poses.insert(0, robot_pose)
-
-        # Refresh timestamps
+        # Refresh timestamps to prevent TF extrapolation errors in Nav2
         now = self.get_clock().now().to_msg()
         path.header.stamp = now
         path.header.frame_id = "map"
@@ -326,6 +272,7 @@ class FleetCoordinator(Node):
         self.path_debug_pubs[robot_name].publish(path)
 
         if not client.wait_for_server(timeout_sec=1.0):
+            self.get_logger().warn(f"Action server not available for {robot_name}")
             return
         
         goal_msg = FollowPath.Goal()

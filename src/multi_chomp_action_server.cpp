@@ -6,9 +6,9 @@ using std::placeholders::_2;
 
 MultiChompActionServer::MultiChompActionServer(
     const rclcpp::NodeOptions & options) 
-    : Node("multi_chomp_action_server", options)
+    : Node("multi_chomp_action_server", options),
+      is_optimizing_(false) // Initialize atomic flag
 {
-    // create optimizer component
     optimizer_ = std::make_shared<MultiChompNode>();
 
     auto exec = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
@@ -30,19 +30,20 @@ MultiChompActionServer::handle_goal(
     const rclcpp_action::GoalUUID &,
     std::shared_ptr<const MultiChompOptimize::Goal> goal)
 {
-  // Forward check to optimizer’s parameters
   if (goal->num_robots == 0 ||
       static_cast<int>(goal->input_paths.size()) != goal->num_robots) {
-    RCLCPP_WARN(this->get_logger(),
-                "Rejecting goal: num_robots = %u, paths.size() = %zu",
-                goal->num_robots, goal->input_paths.size());
+    RCLCPP_WARN(this->get_logger(), "Rejecting goal: invalid path dimensions");
+    return rclcpp_action::GoalResponse::REJECT;
+  }
+
+  bool expected = false;
+  if (!is_optimizing_.compare_exchange_strong(expected, true)) {
+    RCLCPP_WARN(this->get_logger(), "Rejecting goal: Optimizer is currently processing a trajectory");
     return rclcpp_action::GoalResponse::REJECT;
   }
 
   if (optimizer_->get_num_robots() != static_cast<int>(goal->num_robots)) {
-    RCLCPP_INFO(this->get_logger(),
-                "Dynamic reconfiguration: resizing optimizer from %d to %d robots",
-                optimizer_->get_num_robots(), goal->num_robots);
+    RCLCPP_INFO(this->get_logger(), "Dynamic reconfiguration: resizing optimizer");
   }
 
   return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
@@ -81,16 +82,18 @@ void MultiChompActionServer::execute_goal(
     const std::shared_ptr<GoalHandleMultiChomp> goal_handle)
 {
   const auto goal = goal_handle->get_goal();
-
   MultiChompOptimize::Result result;
   MultiChompOptimize::Feedback feedback;
 
-  // check for update every second
+  auto cleanup_state = [this]() {
+      is_optimizing_.store(false);
+  };
+
   rclcpp::Rate wait_rate(1.0); 
   while (rclcpp::ok() && !optimizer_->has_map()) {
       if (goal_handle->is_canceling()) {
           goal_handle->canceled(std::make_shared<MultiChompOptimize::Result>(result));
-          RCLCPP_INFO(this->get_logger(), "Goal canceled while waiting for map");
+          cleanup_state();
           return;
       }
       RCLCPP_WARN(this->get_logger(), "Waiting for global costmap...");
@@ -98,34 +101,40 @@ void MultiChompActionServer::execute_goal(
   }
 
   if (!load_paths_into_state(goal->input_paths)) {
-    RCLCPP_ERROR(this->get_logger(),
-                 "Failed to load input paths into optimizer");
     goal_handle->abort(std::make_shared<MultiChompOptimize::Result>(result));
+    cleanup_state();
     return;
   }
 
   const uint32_t max_iter = (goal->max_iterations > 0) ? goal->max_iterations : 100;
-  const double min_cost_change = 1e-4; // convergence threshold
+  const double min_cost_change = 1e-4;
   double prev_cost = 1e9;
+  uint32_t plateau_count = 0;
 
   for (uint32_t iter = 0; iter < max_iter; ++iter) {
     if (goal_handle->is_canceling()) {
       goal_handle->canceled(std::make_shared<MultiChompOptimize::Result>(result));
+      cleanup_state();
       return;
     }
 
     optimizer_->solve_step();
     double current_cost = optimizer_->compute_current_cost();
     
-    // check convergence
-    if (std::abs(prev_cost - current_cost) < min_cost_change) {
-      RCLCPP_INFO(this->get_logger(), "Converged at iteration %u", iter);
-      break;
+    if (iter > 10) {
+      if (std::abs(prev_cost - current_cost) < min_cost_change) {
+        plateau_count++;
+        if (plateau_count >= 3) {
+          RCLCPP_INFO(this->get_logger(), "Converged at iteration %u", iter);
+          break;
+        }
+      } else {
+        plateau_count = 0;
+      }
     }
 
     prev_cost = current_cost;
     
-    // throttled feedback
     if (iter % 10 == 0) {
       feedback.progress = static_cast<float>(iter) / static_cast<float>(max_iter);
       feedback.current_iteration = iter;
@@ -136,4 +145,5 @@ void MultiChompActionServer::execute_goal(
 
   result.optimized_paths = export_state_to_paths(goal->input_paths);
   goal_handle->succeed(std::make_shared<MultiChompOptimize::Result>(result));
+  cleanup_state();
 }
