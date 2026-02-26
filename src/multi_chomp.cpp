@@ -7,13 +7,13 @@ MultiChompNode::MultiChompNode() : Node("multi_chomp_server") {
     load_parameters();
     init_matrices();
     // ROS interface
-    marker_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray> ("plan_markers", 10);
+    marker_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray> ("plan_markers", 20);
     rclcpp::QoS map_qos(1);
     map_qos.transient_local();
 
     // occupancy grid subscription
     grid_sub_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>
-        ("/global_costmap/costmap", map_qos, std::bind(&MultiChompNode::map_callback, this, _1));
+        ("robot1/global_costmap/costmap", map_qos, std::bind(&MultiChompNode::map_callback, this, _1));
 
     // timer (using action call for syncing the optimization step)
     // timer_ = this->create_wall_timer(std::chrono::milliseconds(33), std::bind(&MultiChompNode::solve_step, this));
@@ -24,10 +24,10 @@ MultiChompNode::MultiChompNode() : Node("multi_chomp_server") {
 void MultiChompNode::load_parameters()
 {
     this->declare_parameter<int>("num_robots", 6);
-    this->declare_parameter<int>("waypoints_per_robot", 50);
-    this->declare_parameter<double>("dt", 1.0);
-    this->declare_parameter<double>("eta", 500.0);
-    this->declare_parameter<double>("lambda", 10.0);
+    this->declare_parameter<int>("waypoints_per_robot", 20);
+    this->declare_parameter<double>("dt", 0.1);
+    this->declare_parameter<double>("eta", 100.0);
+    this->declare_parameter<double>("lambda", 0.1);
     this->declare_parameter<double>("mu", 0.4);
     // assuming robot_radius and obstacle_max_dist are also parameters or constants
     params_.robot_radius = 0.5;
@@ -380,9 +380,10 @@ void MultiChompNode::solve_step() {
   if (!map_received_) return;
 
   // 1. Recompute bbR (Bias for start/end points)
-  // The reference recomputes this every step to handle moving start/end.
   const int nq = params_.waypoints_per_robot;
   const double dt = params_.dt;
+  
+  // The scaling factor must EXACTLY match the scaling applied to AAR_ in init_matrices()
   const double scaling_factor = 1.0 / (dt * dt * (nq + 1));
 
   bbR_ = VectorXd::Zero(xidim_);
@@ -391,15 +392,19 @@ void MultiChompNode::solve_step() {
       size_t robot_offset = static_cast<size_t>(r) * nq * cdim_;
 
       if (r < static_cast<int>(start_states_.size())) {
+          // Force of the fixed start point on the first moving waypoint (index 0)
           bbR_.block(robot_offset, 0, cdim_, 1) = start_states_[r];
       }
       if (r < static_cast<int>(goal_states_.size())) {
+          // Force of the fixed goal point on the last moving waypoint (index nq-1)
           size_t end_idx = robot_offset + static_cast<size_t>(nq - 1) * cdim_;
           bbR_.block(end_idx, 0, cdim_, 1) = goal_states_[r];
       }
   }
-  // Apply scaling to match AAR_
+  // Apply the same scaling factor. The negative sign is because moving the waypoint 
+  // away from the boundary creates a restorative force TOWARDS the boundary.
   bbR_ *= -scaling_factor;
+
 
   // 2. Smoothness Gradient (Unprojected)
   // nabla_smooth = AAR * xi + bbR
@@ -492,15 +497,29 @@ void MultiChompNode::solve_step() {
       }
   }
 
-  // 4. Update Step
-  VectorXd full_grad = nabla_obs + params_.lambda * nabla_smooth + params_.mu * nabla_inter;
+  // 4. Update Step (Pure Covariant Gradient Descent)
+  
+  // Combine external non-linear gradients
+  VectorXd external_grad = nabla_obs + params_.mu * nabla_inter;
 
-  // Clip gradient
-  double g_norm = full_grad.norm();
-  if (g_norm > 1e6) full_grad *= (1e6 / g_norm);
+  // Clip the external gradient to prevent extreme spikes near obstacles
+  double g_norm = external_grad.norm();
+  if (g_norm > 1e6) {
+      external_grad *= (1e6 / g_norm);
+  }
 
-  VectorXd dxi = AARinv_ * full_grad;
-  xi_ -= dxi / params_.eta;
+  // Precondition the external gradients by spreading them over the trajectory
+  VectorXd smooth_external_update = AARinv_ * external_grad;
+  
+  // Calculate the analytical smoothness update
+  // AARinv_ * bbR_ calculates the "unconstrained smooth curve" between start and end
+  // (xi_ + AARinv_ * bbR_) represents how far the current trajectory deviates from that perfect curve
+  VectorXd smooth_prior_update = xi_ + AARinv_ * bbR_;
+
+  // Final Covariant Update Rule
+  // The external gradients push the path away from obstacles.
+  // The prior update pulls the path back towards the shortest smooth line.
+  xi_ -= (1.0 / params_.eta) * (smooth_external_update + params_.lambda * smooth_prior_update);
 
   // 5. Hard Constraints (Start/Goal)
   for (int r = 0; r < params_.num_robots; ++r) {
