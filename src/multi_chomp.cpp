@@ -20,10 +20,10 @@ MultiChompNode::MultiChompNode() : Node("multi_chomp_server") {
 void MultiChompNode::load_parameters() {
   this->declare_parameter<int>("num_robots", 6);
   this->declare_parameter<int>("waypoints_per_robot", 100);
-  this->declare_parameter<double>("dt", 1.0);
-  this->declare_parameter<double>("eta", 1000.0); // update parameter is 1/eta
-  this->declare_parameter<double>("lambda", 0.1);
-  this->declare_parameter<double>("mu", 1.0);
+  this->declare_parameter<double>("dt", 0.1);
+  this->declare_parameter<double>("eta", 10000.0); // update parameter is 1/eta
+  this->declare_parameter<double>("lambda", 0.01);
+  this->declare_parameter<double>("mu", 10.0);
 
   params_.robot_radius = 0.5;
   params_.obstacle_max_dist = 4.0;
@@ -76,31 +76,39 @@ void MultiChompNode::update_distance_map(const nav_msgs::msg::OccupancyGrid& gri
   map_width_ = grid.info.width;
   map_height_ = grid.info.height;
 
-  cv::Mat bin_img(map_height_, map_width_, CV_8UC1);
+  // Create a floating point matrix directly to store the continuous cost field
+  cv::Mat raw_cost_map(map_height_, map_width_, CV_64FC1);
 
   for (int i = 0; i < map_height_; ++i) {
-      int ros_row = (map_height_ - 1) - i;
+      int ros_row = (map_height_ - 1) - i; // ROS y-axis points up, OpenCV y-axis points down
       for (int j = 0; j < map_width_; ++j) {
           int8_t val = grid.data[ros_row * map_width_ + j];
-          if (val == -1 || val > 50) {
-              bin_img.at<uint8_t>(i, j) = 0; 
+          
+          if (val == -1) {
+              // Treat unknown space as a moderate/high cost to avoid wandering into the unknown
+              raw_cost_map.at<double>(i, j) = 50.0;
           } else {
-              bin_img.at<uint8_t>(i, j) = 255;
+              // Map the [0, 100] occupancy grid directly to a double.
+              raw_cost_map.at<double>(i, j) = static_cast<double>(val);
           }
       }
   }
 
-  cv::Mat dist_img_pixels;
-  cv::distanceTransform(bin_img, dist_img_pixels, cv::DIST_L2, 5);
-  dist_img_pixels.convertTo(dist_map_, CV_64F, map_resolution_);
+  // Apply a mild Gaussian blur to smooth the discrete 0-100 steps from the ROS costmap.
+  // This provides C_1 continuity, preventing optimization jitter on grid boundaries.
+  cv::GaussianBlur(raw_cost_map, dist_map_, cv::Size(5, 5), 1.0);
 
-  cv::Sobel(dist_map_, dist_grad_x_, CV_64F, 1, 0, 3);
-  cv::Sobel(dist_map_, dist_grad_y_, CV_64F, 0, 1, 3);
+  // Compute continuous gradients directly from the smoothed cost field.
+  // Because dist_map_ represents COST (not distance), the gradient points TOWARD higher cost.
+  // We compute the Sobel derivative taking map resolution into account.
+  cv::Sobel(dist_map_, dist_grad_x_, CV_64F, 1, 0, 3, 1.0 / (8.0 * map_resolution_));
+  cv::Sobel(dist_map_, dist_grad_y_, CV_64F, 0, 1, 3, 1.0 / (8.0 * map_resolution_));
 
+  // OpenCV y-axis points down, ROS y-axis points up, so we invert the y-gradient
   dist_grad_y_ = -dist_grad_y_;
 }
 
-double MultiChompNode::get_environment_distance(double x, double y, Eigen::Vector2d& gradient) const {
+double MultiChompNode::get_environment_cost(double x, double y, Eigen::Vector2d& gradient) const {
   if (dist_map_.empty()) {
       gradient << 0.0, 0.0;
       return 999.0;
@@ -134,8 +142,8 @@ double MultiChompNode::get_environment_distance(double x, double y, Eigen::Vecto
   int v = static_cast<int>(gy);
 
   double dist = dist_map_.at<double>(v, u);
-  double dx   = dist_grad_x_.at<double>(v, u);
-  double dy   = dist_grad_y_.at<double>(v, u);
+  double dx   = - dist_grad_x_.at<double>(v, u);
+  double dy   = - dist_grad_y_.at<double>(v, u);
 
   double norm = std::sqrt(dx * dx + dy * dy);
   if (norm > 1e-5) {
@@ -354,15 +362,14 @@ void MultiChompNode::solve_step() {
           VectorXd kappa = (prj * xdd) / (vel * vel);
 
           Eigen::Vector2d grad_env;
-          double dist = get_environment_distance(qq(0), qq(1), grad_env);
+          double cost_val = get_environment_cost(qq(0), qq(1), grad_env);
 
-          if (dist < params_.obstacle_max_dist) {
-              double gain = 2.0; 
-              double term = (1.0 - dist / params_.obstacle_max_dist);
-              double cost = gain * params_.obstacle_max_dist * std::pow(term, 3.0) / 3.0;
-
-              VectorXd delta = -gain * std::pow(term, 2.0) * VectorXd(grad_env);
-              nabla_obs.block(idx, 0, cdim_, 1) += vel * (prj * delta - cost * kappa);
+          // If the point is in an inflated or lethal region (cost > 0)
+          if (cost_val > 1.0) {
+              // The environmental gradient points toward the obstacle (higher cost).
+              // We want to push AWAY from the obstacle, so we take the negative gradient.
+              VectorXd delta = -VectorXd(grad_env);
+              nabla_obs.block(idx, 0, cdim_, 1) += vel * (prj * delta * params_.dt * cost_val - cost_val * kappa);
           }
 
           const double safety_dist = 2.0 * params_.robot_radius;
@@ -388,7 +395,7 @@ void MultiChompNode::solve_step() {
   }
 
   // 3. Combine 
-  VectorXd full_grad = params_.dt * nabla_obs + params_.lambda * nabla_smooth + params_.mu * nabla_inter;
+  VectorXd full_grad = nabla_obs + params_.lambda * nabla_smooth + params_.mu * nabla_inter;
 
   // Clip gradient before preconditioning to prevent wild values
   double g_norm = full_grad.norm();
@@ -437,9 +444,9 @@ double MultiChompNode::compute_current_cost() const {
       VectorXd p1 = xi_.block(idx1, 0, cdim_, 1);
       
       Eigen::Vector2d grad_env;
-      double dist = get_environment_distance(p1(0), p1(1), grad_env);
-      if (dist < params_.obstacle_max_dist) {
-        double penetration = params_.obstacle_max_dist - dist;
+      double dist = get_environment_cost(p1(0), p1(1), grad_env);
+      if (dist > 0.0) {
+        double penetration = dist;
         obstacle_cost += penetration * penetration;
       }
 

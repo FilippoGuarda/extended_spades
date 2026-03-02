@@ -95,7 +95,7 @@ private:
 
   void map_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
 
-  double get_environment_distance(double x, double y, Eigen::Vector2d& gradient) const;
+  double get_environment_cost(double x, double y, Eigen::Vector2d& gradient) const;
 
   // helpers initialization
   void load_parameters();
