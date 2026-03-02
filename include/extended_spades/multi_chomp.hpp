@@ -50,8 +50,12 @@ public:
   double compute_current_cost() const;
 
   // export state as optimized path
-  std::vector<nav_msgs::msg::Path>
-  get_paths(const std::vector<nav_msgs::msg::Path> & templates) const;
+  std::vector<nav_msgs::msg::Path> get_paths(const std::vector<nav_msgs::msg::Path> & templates) const;
+  rclcpp::TimerBase::SharedPtr optim_timer_;
+  void timer_callback();
+  void update_starts_from_tf();
+  std::vector<rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr> path_pubs_;
+  int iteration_count_ = 0;
 
 private:
   // visualization publisher
@@ -59,6 +63,8 @@ private:
 
   // costmap subscriber
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr grid_sub_;
+  bool optimization_active_ = false;
+  std::mutex trajectory_mutex_;
 
   // state protection lock
   mutable std::mutex map_mutex_;
@@ -105,8 +111,8 @@ private:
   // helpers initialization
   void load_parameters();
   void init_matrices();
-
   void publish_state();
+  
 };
 
 

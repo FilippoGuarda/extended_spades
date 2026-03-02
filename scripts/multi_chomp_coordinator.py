@@ -336,7 +336,7 @@ class FleetCoordinator(Node):
             # our closed-loop reoptimization intentionally preempts the action server.
             if status == GoalStatus.STATUS_SUCCEEDED:
                 self.moving_robots.discard(robot_name)
-            elif status ==      .STATUS_ABORTED:
+            elif status == GoalStatus.STATUS_ABORTED:
                 self.get_logger().warn(f"Nav2 Execution aborted for {robot_name}")
                 self.moving_robots.discard(robot_name)
         except Exception:
