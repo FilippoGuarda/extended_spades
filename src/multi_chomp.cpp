@@ -12,7 +12,7 @@ MultiChompNode::MultiChompNode() : Node("multi_chomp_server") {
   map_qos.transient_local();
 
   grid_sub_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
-      "/global_costmap/costmap", map_qos, std::bind(&MultiChompNode::map_callback, this, _1));
+      "robot1/global_costmap/costmap", map_qos, std::bind(&MultiChompNode::map_callback, this, _1));
 
   RCLCPP_INFO(this->get_logger(), "Multi-CHOMP server initialized for %d robots", params_.num_robots);
 }
@@ -20,9 +20,9 @@ MultiChompNode::MultiChompNode() : Node("multi_chomp_server") {
 void MultiChompNode::load_parameters() {
   this->declare_parameter<int>("num_robots", 6);
   this->declare_parameter<int>("waypoints_per_robot", 100);
-  this->declare_parameter<double>("dt", 0.1);
+  this->declare_parameter<double>("dt", 1.0);
   this->declare_parameter<double>("eta", 1000.0); // update parameter is 1/eta
-  this->declare_parameter<double>("lambda", 1.0);
+  this->declare_parameter<double>("lambda", 0.1);
   this->declare_parameter<double>("mu", 1.0);
 
   params_.robot_radius = 0.5;
@@ -111,6 +111,7 @@ double MultiChompNode::get_environment_distance(double x, double y, Eigen::Vecto
   const double min_y = map_origin_y_ + map_resolution_;
   const double max_y = map_origin_y_ + (map_height_ - 2) * map_resolution_;
 
+  // generate a vector that pushes towards the map limits to prevent explosions
   if (x < min_x || x > max_x || y < min_y || y > max_y) {
       double grad_x = 0.0, grad_y = 0.0;
       double sq_pen_dist = 0.0;
@@ -387,7 +388,7 @@ void MultiChompNode::solve_step() {
   }
 
   // 3. Combine 
-  VectorXd full_grad = nabla_obs + params_.lambda * nabla_smooth + params_.mu * nabla_inter;
+  VectorXd full_grad = params_.dt * nabla_obs + params_.lambda * nabla_smooth + params_.mu * nabla_inter;
 
   // Clip gradient before preconditioning to prevent wild values
   double g_norm = full_grad.norm();
@@ -396,10 +397,6 @@ void MultiChompNode::solve_step() {
   // 4. Precondition
   VectorXd dxi = AARinv_ * full_grad;
 
-  // CRITICAL FIX: The preconditioner AARinv_ spans the entire trajectory. 
-  // Because the boundary rows of AAR_ couple with the interior, AARinv_ WILL inject 
-  // non-zero update values into the boundary elements of dxi. 
-  // We MUST explicitly zero out the boundary components of the step BEFORE applying it.
   for (int r = 0; r < params_.num_robots; ++r) {
       size_t offset = static_cast<size_t>(r) * nq * cdim_;
       dxi.block(offset, 0, cdim_, 1).setZero();

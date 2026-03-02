@@ -19,9 +19,11 @@ class FleetCoordinator(Node):
         # --- Configuration ---
         self.declare_parameter('robot_count', 6)
         self.declare_parameter('controller_id', 'FollowPath')
+        self.declare_parameter('waypoints_per_robot', 100 )
         
         self.robot_count = self.get_parameter('robot_count').value
         self.controller_id = self.get_parameter('controller_id').value
+        self.waypoints_per_robot = self.get_parameter('waypoints_per_robot').value
         self.robot_names = [f'robot{i}' for i in range(1, self.robot_count + 1)]
         
         self.get_logger().info(f"Fleet Coordinator Active: {self.robot_names}")
@@ -95,7 +97,7 @@ class FleetCoordinator(Node):
             # Throttle log to avoid spam
             return None
 
-    def create_holding_path(self, robot_name, length=20):
+    def create_holding_path(self, robot_name):
         """Generates a static path at the robot's current position."""
         pose = self.get_robot_pose(robot_name)
         if not pose:
@@ -105,7 +107,7 @@ class FleetCoordinator(Node):
         path = nav_msgs.msg.Path()
         path.header = pose.header
         # Fill path with identical poses
-        path.poses = [pose for _ in range(length)]
+        path.poses = [pose for _ in range(self.waypoints_per_robot)]
         return path
 
     def goal_callback(self, msg, robot_name):
