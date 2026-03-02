@@ -7,7 +7,8 @@ MultiChompNode::MultiChompNode() : Node("multi_chomp_server") {
   init_matrices();
 
   marker_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("plan_markers", 100);
-  
+  tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
   rclcpp::QoS map_qos(1);
   map_qos.transient_local();
 
@@ -288,30 +289,86 @@ bool MultiChompNode::set_paths(const std::vector<nav_msgs::msg::Path> & paths) {
   int new_num_robots = static_cast<int>(paths.size());
   const int nq = params_.waypoints_per_robot;
 
-  if (nq <= 1) return false;
+  if (nq <= 1 || new_num_robots == 0) return false;
 
-  if (new_num_robots != params_.num_robots) {
+  // If robot count changes OR vectors are empty, we MUST reset completely
+  bool reset_required = (new_num_robots != params_.num_robots) || 
+                        (goal_states_.size() != static_cast<size_t>(new_num_robots));
+
+  if (reset_required) {
       params_.num_robots = new_num_robots;
       xidim_ = params_.num_robots * nq * cdim_;
       xi_ = VectorXd::Zero(xidim_);
       init_matrices(); 
+      
+      start_states_.resize(params_.num_robots, Eigen::Vector2d::Zero());
+      goal_states_.resize(params_.num_robots, Eigen::Vector2d::Zero());
   }
-
-  start_states_.resize(params_.num_robots);
-  goal_states_.resize(params_.num_robots);
 
   for (int r = 0; r < params_.num_robots; ++r) {
       const auto & path = paths[r];
       if (path.poses.size() < 2) return false;
 
-      start_states_[r] = Eigen::Vector2d(path.poses.front().pose.position.x, path.poses.front().pose.position.y);
-      goal_states_[r]  = Eigen::Vector2d(path.poses.back().pose.position.x,  path.poses.back().pose.position.y);
-
-      auto samples = resample_path(path, nq);
+      Eigen::Vector2d new_start(path.poses.front().pose.position.x, path.poses.front().pose.position.y);
+      Eigen::Vector2d new_goal(path.poses.back().pose.position.x, path.poses.back().pose.position.y);
+      
       size_t robot_offset = static_cast<size_t>(r) * nq * cdim_;
-      for (int k = 0; k < nq; ++k) {
-          xi_.block(robot_offset + k * cdim_, 0, cdim_, 1) = samples[k];
+
+      bool can_shift = false;
+      int shift_idx = 0;
+
+      // Only attempt shift if we didn't just hard-reset the matrices
+      if (!reset_required) {
+          // At this point, we are 100% mathematically guaranteed that goal_states_.size() == num_robots
+          double goal_dist = (goal_states_[r] - new_goal).norm();
+          
+          if (goal_dist < 0.1) {
+              double min_dist = std::numeric_limits<double>::infinity();
+              for (int k = 0; k < nq; ++k) {
+                  Eigen::Vector2d current_pt = xi_.block(robot_offset + k * cdim_, 0, cdim_, 1);
+                  double dist = (current_pt - new_start).norm();
+                  if (dist < min_dist) {
+                      min_dist = dist;
+                      shift_idx = k;
+                  }
+              }
+              
+              if (min_dist < 1.0 && shift_idx > 0) {
+                  can_shift = true;
+              } else if (shift_idx == 0) {
+                  can_shift = true; 
+              }
+          }
       }
+
+      if (can_shift) {
+          if (shift_idx > 0 && shift_idx < nq) {
+              // 1. Shift the remaining trajectory backward by shift_idx
+              for (int k = 0; k < nq - shift_idx; ++k) {
+                  xi_.block(robot_offset + k * cdim_, 0, cdim_, 1) = 
+                      xi_.block(robot_offset + (k + shift_idx) * cdim_, 0, cdim_, 1);
+              }
+              // 2. Pad the freed space at the end with the goal position
+              for (int k = nq - shift_idx; k < nq; ++k) {
+                  xi_.block(robot_offset + k * cdim_, 0, cdim_, 1) = new_goal;
+              }
+          }
+          xi_.block(robot_offset, 0, cdim_, 1) = new_start;
+      } else {
+          auto samples = resample_path(path, nq);
+          
+          if (samples.size() != static_cast<size_t>(nq)) {
+              RCLCPP_ERROR(this->get_logger(), "Resample failed: got %zu points, expected %d", samples.size(), nq);
+              return false;
+          }
+          
+          for (int k = 0; k < nq; ++k) {
+              xi_.block(robot_offset + k * cdim_, 0, cdim_, 1) = samples[k];
+          }
+      }
+
+      start_states_[r] = new_start;
+      goal_states_[r]  = new_goal;
   }
   return true;
 }

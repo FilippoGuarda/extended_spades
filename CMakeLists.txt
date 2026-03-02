@@ -16,6 +16,7 @@ find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(nav_msgs REQUIRED)        
 find_package(rosidl_default_generators REQUIRED) 
+find_package(tf2_ros REQUIRED) 
 
 # first we generate required interfaces
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -39,6 +40,7 @@ ament_target_dependencies(multi_chomp_action_server
   nav_msgs
   Eigen3
   OpenCV
+  tf2_ros
 )
 
 target_include_directories(multi_chomp_action_server PUBLIC

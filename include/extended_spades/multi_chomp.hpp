@@ -9,6 +9,8 @@
 #include <Eigen/Dense>
 #include <random>
 #include <opencv2/opencv.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 
 #include "rclcpp/rclcpp.hpp"
 #include "visualization_msgs/msg/marker_array.hpp"
@@ -92,6 +94,9 @@ private:
   std::vector<Vector2d> goal_states_;
   // extend a provided path into a fixed number of waypoints
   std::vector<Vector2d> resample_path(const nav_msgs::msg::Path & path, int num_points) const;
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+  std::vector<int> freeze_indices_; 
 
   void map_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
 
@@ -102,7 +107,6 @@ private:
   void init_matrices();
 
   void publish_state();
-
 };
 
 
