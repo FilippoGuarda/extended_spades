@@ -16,7 +16,7 @@ MultiChompNode::MultiChompNode() : Node("multi_chomp_server") {
   
   for(int r = 0; r < params_.num_robots; ++r) {
       path_pubs_.push_back(this->create_publisher<nav_msgs::msg::Path>(
-          "robot" + std::to_string(r) + "/optimized_path", 10));
+          "robot" + std::to_string(r + 1) + "/optimized_path", 10));
   }
 
   tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
@@ -247,85 +247,58 @@ std::vector<Eigen::Vector2d> MultiChompNode::resample_path(const nav_msgs::msg::
 }
 
 bool MultiChompNode::set_paths(const std::vector<nav_msgs::msg::Path> & paths) {
-  // 3. FIXED: Thread Safety - lock during matrix manipulation
-  std::lock_guard<std::mutex> lock(trajectory_mutex_);
+    // 3. FIXED: Thread Safety - lock during matrix manipulation
+    std::lock_guard<std::mutex> lock(trajectory_mutex_);
 
-  int new_num_robots = static_cast<int>(paths.size());
-  const int nq = params_.waypoints_per_robot;
+    int new_num_robots = static_cast<int>(paths.size());
+    const int nq = params_.waypoints_per_robot;
 
-  if (nq <= 1 || new_num_robots == 0) return false;
+    if (nq <= 1 || new_num_robots == 0) return false;
 
-  bool reset_required = (new_num_robots != params_.num_robots) ||
-                        (goal_states_.size() != static_cast<size_t>(new_num_robots));
+    bool reset_required = (new_num_robots != params_.num_robots) ||
+                          (goal_states_.size() != static_cast<size_t>(new_num_robots));
 
-  if (reset_required) {
-      optimization_active_ = false; // Freeze solver
-      params_.num_robots = new_num_robots;
-      xidim_ = params_.num_robots * nq * cdim_;
-      xi_ = VectorXd::Zero(xidim_);
-      init_matrices();
+    if (reset_required) {
+        optimization_active_ = false; // Freeze solver
+        params_.num_robots = new_num_robots;
+        xidim_ = params_.num_robots * nq * cdim_;
+        xi_ = VectorXd::Zero(xidim_);
+        init_matrices();
 
-      start_states_.resize(params_.num_robots, Eigen::Vector2d::Zero());
-      goal_states_.resize(params_.num_robots, Eigen::Vector2d::Zero());
+        start_states_.resize(params_.num_robots, Eigen::Vector2d::Zero());
+        goal_states_.resize(params_.num_robots, Eigen::Vector2d::Zero());
 
-      path_pubs_.clear();
-      for(int r = 0; r < params_.num_robots; ++r) {
-          path_pubs_.push_back(this->create_publisher<nav_msgs::msg::Path>(
-              "robot" + std::to_string(r) + "/optimized_path", 10));
-      }
-  }
+        path_pubs_.clear();
+        for(int r = 0; r < params_.num_robots; ++r) {
+            path_pubs_.push_back(this->create_publisher<nav_msgs::msg::Path>(
+                "robot" + std::to_string(r + 1) + "/optimized_path", 10));
+        }
+    }
 
-  for (int r = 0; r < params_.num_robots; ++r) {
-      const auto & path = paths[r];
-      if (path.poses.size() < 2) return false;
+    for (int r = 0; r < params_.num_robots; ++r) {
+        const auto & path = paths[r];
 
-      Eigen::Vector2d new_start(path.poses.front().pose.position.x, path.poses.front().pose.position.y);
-      Eigen::Vector2d new_goal(path.poses.back().pose.position.x, path.poses.back().pose.position.y);
-      size_t robot_offset = static_cast<size_t>(r) * nq * cdim_;
+        // NEW LOGIC: Empty path means "Keep existing active trajectory"
+        if (path.poses.empty()) {
+            if (reset_required) return false;
+            continue;
+        }
 
-      if (!reset_required) {
-          double goal_dist = (goal_states_[r] - new_goal).norm();
+        if (path.poses.size() < 2) return false;
 
-          if (goal_dist < 0.1) {
-              int shift_idx = 0;
-              double min_dist = std::numeric_limits<double>::infinity();
+        Eigen::Vector2d new_start(path.poses.front().pose.position.x, path.poses.front().pose.position.y);
+        Eigen::Vector2d new_goal(path.poses.back().pose.position.x, path.poses.back().pose.position.y);
+        size_t robot_offset = static_cast<size_t>(r) * nq * cdim_;
 
-              for (int k = 0; k < nq; ++k) {
-                  Eigen::Vector2d current_pt = xi_.block(robot_offset + k * cdim_, 0, cdim_, 1);
-                  double dist = (current_pt - new_start).norm();
-                  if (dist < min_dist) { min_dist = dist; shift_idx = k; }
-              }
+        auto samples = resample_path(path, nq);
+        if (samples.size() != static_cast<size_t>(nq)) return false;
+        for (int k = 0; k < nq; ++k) xi_.block(robot_offset + k * cdim_, 0, cdim_, 1) = samples[k];
+        start_states_[r] = new_start;
+        goal_states_[r] = new_goal;
+    }
 
-              if (shift_idx > 0 && shift_idx < nq) {
-                  for (int k = 0; k < nq - shift_idx; ++k) {
-                      xi_.block(robot_offset + k * cdim_, 0, cdim_, 1) =
-                          xi_.block(robot_offset + (k + shift_idx) * cdim_, 0, cdim_, 1);
-                  }
-                  for (int k = nq - shift_idx; k < nq; ++k) {
-                      xi_.block(robot_offset + k * cdim_, 0, cdim_, 1) = new_goal;
-                  }
-              }
-              xi_.block(robot_offset, 0, cdim_, 1) = new_start;
-              start_states_[r] = new_start;
-              goal_states_[r] = new_goal;
-          } else {
-              auto samples = resample_path(path, nq);
-              if (samples.size() != static_cast<size_t>(nq)) return false;
-              for (int k = 0; k < nq; ++k) xi_.block(robot_offset + k * cdim_, 0, cdim_, 1) = samples[k];
-              start_states_[r] = new_start;
-              goal_states_[r] = new_goal;
-          }
-      } else {
-          auto samples = resample_path(path, nq);
-          if (samples.size() != static_cast<size_t>(nq)) return false;
-          for (int k = 0; k < nq; ++k) xi_.block(robot_offset + k * cdim_, 0, cdim_, 1) = samples[k];
-          start_states_[r] = new_start;
-          goal_states_[r] = new_goal;
-      }
-  }
-
-  optimization_active_ = true; // Unlock execution
-  return true;
+    optimization_active_ = true; // Unlock execution
+    return true;
 }
 
 void MultiChompNode::update_starts_from_tf() {
@@ -334,24 +307,36 @@ void MultiChompNode::update_starts_from_tf() {
   for (int r = 0; r < params_.num_robots; ++r) {
       geometry_msgs::msg::TransformStamped tf;
       try {
-          tf = tf_buffer_->lookupTransform("map", "robot" + std::to_string(r) + "/base_link", tf2::TimePointZero);
+          tf = tf_buffer_->lookupTransform("map", "robot" + std::to_string(r + 1) + "/base_link", tf2::TimePointZero);
       } catch (const tf2::TransformException & ex) {
           continue; 
       }
-      
+
       Eigen::Vector2d current_pos(tf.transform.translation.x, tf.transform.translation.y);
       size_t offset = static_cast<size_t>(r) * nq * cdim_;
-      
+
       int shift_idx = 0;
       double min_dist = std::numeric_limits<double>::infinity();
       int search_horizon = std::min(nq, 15); 
-      
+
       for (int k = 0; k < search_horizon; ++k) {
           Eigen::Vector2d pt = xi_.block(offset + k * cdim_, 0, cdim_, 1);
           double dist = (pt - current_pos).norm();
           if (dist < min_dist) { min_dist = dist; shift_idx = k; }
       }
-      
+
+      // if path too corrupted just ask new plan
+      if (min_dist > 0.5) {
+          Eigen::Vector2d delta = current_pos - xi_.block(offset + shift_idx * cdim_, 0, cdim_, 1);
+          for (int k = 0; k < nq; ++k) {
+              xi_.block(offset + k * cdim_, 0, cdim_, 1) += delta;
+          }
+          start_states_[r] = current_pos;
+          goal_states_[r] += delta;
+          continue;
+      }
+
+      // Normal clipping
       if (shift_idx > 0) {
           for (int k = 0; k < nq - shift_idx; ++k) {
               xi_.block(offset + k * cdim_, 0, cdim_, 1) = xi_.block(offset + (k + shift_idx) * cdim_, 0, cdim_, 1);
@@ -360,10 +345,24 @@ void MultiChompNode::update_starts_from_tf() {
               xi_.block(offset + k * cdim_, 0, cdim_, 1) = goal_states_[r];
           }
       }
+
+      Eigen::Vector2d new_pt0 = xi_.block(offset, 0, cdim_, 1);
+      Eigen::Vector2d delta = current_pos - new_pt0;
+
+      if (delta.norm() > 0.02) {
+          // Smoothly blend the positional error into the first 5 waypoints
+          int blend_horizon = std::min(nq, 5);
+          for (int k = 0; k < blend_horizon; ++k) {
+              double weight = 1.0 - (static_cast<double>(k) / blend_horizon);
+              xi_.block(offset + k * cdim_, 0, cdim_, 1) += delta * weight;
+          }
+      }
+
       xi_.block(offset, 0, cdim_, 1) = current_pos;
       start_states_[r] = current_pos;
   }
 }
+
 
 void MultiChompNode::timer_callback() {
   std::lock_guard<std::mutex> traj_lock(trajectory_mutex_); // 3. FIXED: Synchronize timer with setter
@@ -521,7 +520,7 @@ void MultiChompNode::publish_state() {
       visualization_msgs::msg::Marker marker;
       marker.header.frame_id = "map";
       marker.header.stamp = this->now();
-      marker.ns = "robot_" + std::to_string(r);
+      marker.ns = "robot_" + std::to_string(r + 1);
       marker.id = r;
       marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
       marker.action = visualization_msgs::msg::Marker::ADD;

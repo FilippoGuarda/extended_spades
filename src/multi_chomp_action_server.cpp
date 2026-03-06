@@ -143,6 +143,7 @@ void MultiChompActionServer::execute_goal(
     }
   }
 
+  optimizer_->update_starts_from_tf();
   result.optimized_paths = export_state_to_paths(goal->input_paths);
   goal_handle->succeed(std::make_shared<MultiChompOptimize::Result>(result));
   cleanup_state();

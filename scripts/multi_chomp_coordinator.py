@@ -195,7 +195,12 @@ class FleetCoordinator(Node):
         
         goal_msg = MultiChompOptimize.Goal()
         goal_msg.num_robots = self.robot_count
-        goal_msg.max_iterations = 100
+
+        # Dynamic iterations: 100 for initial convergence, 10 for sliding-window updates
+        if len(self.new_plan_buffer) > 0:
+            goal_msg.max_iterations = 100
+        else:
+            goal_msg.max_iterations = 10
         
         inputs_valid = True
         
@@ -217,9 +222,13 @@ class FleetCoordinator(Node):
             if name in self.new_plan_buffer:
                 # Case A: Nav2 generated a fresh global route
                 path_to_send = self.new_plan_buffer[name]
+                if current_pose and len(path_to_send.poses) > 0:
+                    start_poses = [current_pose for _ in range(3)]
+                    path_to_send.poses = start_poses + path_to_send.poses
+                
                 self.active_paths[name] = path_to_send
             elif name in self.active_paths and name in self.moving_robots:
-                path_to_send = self.active_paths[name]
+                path_to_send = nav_msgs.msg.Path()
             else:
                 # Case B: Robot is idle/holding. Send "Stationary Path"
                 # This ensures CHOMP knows this robot is an obstacle!
@@ -332,13 +341,14 @@ class FleetCoordinator(Node):
     def execute_result_callback(self, future, robot_name):
         try:
             status = future.result().status
-            # We do NOT discard on PREEMPTED / CANCELED (value 4) because 
-            # our closed-loop reoptimization intentionally preempts the action server.
+
             if status == GoalStatus.STATUS_SUCCEEDED:
                 self.moving_robots.discard(robot_name)
+
             elif status == GoalStatus.STATUS_ABORTED:
-                self.get_logger().warn(f"Nav2 Execution aborted for {robot_name}")
-                self.moving_robots.discard(robot_name)
+                # Keep robot in moving_robots so it continues contributing its trajectory to CHOMP.
+                self.get_logger().warn(f"FollowPath aborted for {robot_name}, keeping as moving")
+                # TODO: set a failure counter / re-request Nav2 global plan if repeated aborts
         except Exception:
             pass
 
